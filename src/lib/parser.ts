@@ -1,24 +1,23 @@
 // ============================================================
 // CSV Parser — Hillsborough County real CSV structure.
 //
-// CONFIRMED COLUMN LAYOUT (both Civil and Probate after transformHeader):
+// CONFIRMED columns after transformHeader (snake_case):
 //   casecategory, casetypedescription, casenumber, title,
 //   filingdate, partytype, firstname, middlename,
-//   lastname_companyname, [dateofdeath - probate only],
+//   lastname_companyname, dateofdeath (probate only),
 //   partyaddress, attorney
 //
-// KEY FACTS (confirmed from real production files):
-//   - UTF-8-SIG encoding (BOM \uFEFF at byte 0)
+// CONFIRMED facts from real production files:
+//   - UTF-8 with BOM (\uFEFF byte 0)
 //   - CRLF line endings
-//   - Comma delimited, values quoted with "
-//   - Multiple rows per case (one per party)
-//   - PartyType values (probate):  Petitioner, Decedent, Beneficiary,
-//                                  Trustee, Caveator, Ward, Next of Kin,
-//                                  Subject, Minor
-//   - PartyType values (civil):    Plaintiff, Defendant,
-//                                  Petitioner, Respondent
-//   - PartyAddress: single string "123 St, City, FL 33601"
-//   - Attorney: may be "No Attorney"
+//   - Comma-delimited, double-quoted values
+//   - Multiple rows per case (one row per party)
+//   - PartyType (probate):    Petitioner, Decedent, Beneficiary,
+//                             Trustee, Caveator, Ward, Subject
+//   - PartyType (civil):      Plaintiff, Defendant, Petitioner,
+//                             Respondent
+//   - PartyAddress: "123 St, City, FL 33610"
+//   - Attorney: "No Attorney" when unrepresented
 // ============================================================
 
 import Papa from "papaparse";
@@ -39,37 +38,34 @@ function transformHeader(h: string): string {
   return h.trim().toLowerCase().replace(/[\s\-\/]+/g, "_");
 }
 
-// ---- Sanitize input -------------------------------------------
-// Forces to string (guards against Buffer arriving from axios),
-// strips UTF-8 BOM, normalises line endings.
+// ---- Sanitize: force to string, strip BOM, normalize newlines -
 function sanitize(input: unknown): string {
   let s: string;
 
   if (typeof input === "string") {
     s = input;
+    console.log(`[Parser] Input: string, ${s.length} chars`);
   } else if (Buffer.isBuffer(input)) {
-    // axios responseType:"arraybuffer" decoded by downloader as Buffer
     s = (input as Buffer).toString("utf8");
-    console.log("[Parser] Input was Buffer — converted to utf8 string");
-  } else if (input instanceof ArrayBuffer) {
-    s = Buffer.from(input).toString("utf8");
-    console.log("[Parser] Input was ArrayBuffer — converted to utf8 string");
+    console.log(`[Parser] Input: Buffer → decoded utf8, ${s.length} chars`);
   } else if (input instanceof Uint8Array) {
     s = Buffer.from(input).toString("utf8");
-    console.log("[Parser] Input was Uint8Array — converted to utf8 string");
+    console.log(`[Parser] Input: Uint8Array → decoded utf8, ${s.length} chars`);
+  } else if (input instanceof ArrayBuffer) {
+    s = Buffer.from(input).toString("utf8");
+    console.log(`[Parser] Input: ArrayBuffer → decoded utf8, ${s.length} chars`);
   } else {
-    // Last resort
-    s = String(input);
-    console.log(`[Parser] Input was ${typeof input} — coerced with String()`);
+    s = String(input ?? "");
+    console.log(`[Parser] Input: ${typeof input} → String(), ${s.length} chars`);
   }
 
-  // Strip UTF-8 BOM (\uFEFF = 0xEF 0xBB 0xBF)
-  if (s.charCodeAt(0) === 0xfeff) {
+  // Strip UTF-8 BOM
+  if (s.length > 0 && s.charCodeAt(0) === 0xfeff) {
     s = s.slice(1);
-    console.log("[Parser] Stripped BOM");
+    console.log(`[Parser] Stripped BOM`);
   }
 
-  // Normalise CRLF → LF, bare CR → LF
+  // Normalise line endings → LF
   s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
   return s;
@@ -86,52 +82,52 @@ function assembleName(row: RawRow | null): string | null {
 }
 
 // ---- Address parsing ------------------------------------------
-// Format: "123 Main St, Tampa, FL 33610"
-//         "801 N. Orange Ave, Suite 500, Orlando, FL 32801"
+// "123 Main St, Tampa, FL 33610"
+// "801 N. Orange Ave, Suite 500, Orlando, FL 32801"
 function parseAddress(raw: string | undefined): {
   address: string | null;
   city: string | null;
   state: string;
   zip: string | null;
 } {
-  if (!raw || !raw.trim()) {
-    return { address: null, city: null, state: "FL", zip: null };
-  }
+  const empty = { address: null, city: null, state: "FL", zip: null };
+  if (!raw || !raw.trim()) return empty;
 
-  const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
+  const parts = raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
 
   if (parts.length >= 3) {
-    // Everything except last two parts = street address
-    const streetParts = parts.slice(0, parts.length - 2);
-    const address = cleanString(streetParts.join(", "));
+    const address = cleanString(parts.slice(0, parts.length - 2).join(", "));
     const city = cleanString(parts[parts.length - 2]);
     const stateZip = parts[parts.length - 1].trim();
-    const match = stateZip.match(/^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
-    const state = match ? match[1] : "FL";
-    const zip = match ? normalizeZip(match[2]) : null;
-    return { address, city, state: state || "FL", zip };
-  }
-
-  if (parts.length === 2) {
+    const m = stateZip.match(/^([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
     return {
-      address: cleanString(parts[0]),
-      city: cleanString(parts[1]),
-      state: "FL",
-      zip: null,
+      address,
+      city,
+      state: m ? m[1] : "FL",
+      zip: m ? normalizeZip(m[2]) : null,
     };
   }
-
+  if (parts.length === 2) {
+    return { address: cleanString(parts[0]), city: cleanString(parts[1]), state: "FL", zip: null };
+  }
   return { address: cleanString(raw), city: null, state: "FL", zip: null };
 }
 
-// ---- Group rows by case number --------------------------------
+// ---- Group rows by normalised case number --------------------
 function groupByCaseNumber(rows: RawRow[]): Map<string, RawRow[]> {
   const groups = new Map<string, RawRow[]>();
+  let skippedNoCn = 0;
   for (const row of rows) {
     const cn = normalizeCaseNumber(row["casenumber"]);
-    if (!cn) continue;
+    if (!cn) { skippedNoCn++; continue; }
     if (!groups.has(cn)) groups.set(cn, []);
     groups.get(cn)!.push(row);
+  }
+  if (skippedNoCn > 0) {
+    console.log(`[Parser] Skipped ${skippedNoCn} rows with no casenumber`);
   }
   return groups;
 }
@@ -140,36 +136,28 @@ function groupByCaseNumber(rows: RawRow[]): Map<string, RawRow[]> {
 function pickParty(rows: RawRow[], ...types: string[]): RawRow | null {
   for (const type of types) {
     const found = rows.find(
-      (r) =>
-        (r["partytype"] ?? "").toLowerCase().trim() === type.toLowerCase()
+      (r) => (r["partytype"] ?? "").toLowerCase().trim() === type.toLowerCase()
     );
     if (found) return found;
   }
   return null;
 }
 
-// ---- Main export ----------------------------------------------
+// ---- Main export ---------------------------------------------
 export function parseCsvContent(
   csvContent: unknown,
   filename: string
 ): { probateLeads: ProbateLead[]; foreclosureLeads: ForeclosureLead[] } {
+  console.log(`[Parser] ===== START ${filename} =====`);
 
-  // ---- Step 1: Sanitize ----
-  console.log(`[Parser] === START ${filename} ===`);
-  console.log(`[Parser] Input type: ${typeof csvContent}, isBuffer: ${Buffer.isBuffer(csvContent)}`);
-  console.log(`[Parser] Input length: ${typeof csvContent === "string" ? (csvContent as string).length : "n/a"}`);
-
+  // Step 1: sanitize
   const sanitized = sanitize(csvContent);
-
-  console.log(`[Parser] Sanitized length: ${sanitized.length} chars`);
-  console.log(`[Parser] First 120 chars: ${JSON.stringify(sanitized.slice(0, 120))}`);
-
-  if (!sanitized || sanitized.trim().length === 0) {
-    console.error(`[Parser] ABORT ${filename}: sanitized content is empty`);
+  if (!sanitized.trim()) {
+    console.error(`[Parser] ABORT ${filename}: empty content after sanitize`);
     return { probateLeads: [], foreclosureLeads: [] };
   }
 
-  // ---- Step 2: Parse CSV ----
+  // Step 2: parse CSV
   const result = Papa.parse<RawRow>(sanitized, {
     header: true,
     skipEmptyLines: true,
@@ -180,11 +168,11 @@ export function parseCsvContent(
   console.log(`[Parser] Rows parsed: ${result.data.length}`);
   console.log(`[Parser] Parse errors: ${result.errors.length}`);
   if (result.errors.length > 0) {
-    console.warn(`[Parser] First 3 errors:`, JSON.stringify(result.errors.slice(0, 3)));
+    console.warn(`[Parser] Errors:`, JSON.stringify(result.errors.slice(0, 3)));
   }
 
+  // Retry without skipEmptyLines if 0 rows
   if (result.data.length === 0) {
-    // Attempt 2: no skipEmptyLines
     console.warn(`[Parser] Retrying without skipEmptyLines...`);
     const r2 = Papa.parse<RawRow>(sanitized, {
       header: true,
@@ -192,10 +180,11 @@ export function parseCsvContent(
       transformHeader,
       delimiter: ",",
     });
-    result.data = r2.data.filter((row) =>
-      Object.values(row).some((v) => v && v.trim() !== "")
+    const filtered = r2.data.filter((row) =>
+      Object.values(row).some((v) => v && String(v).trim() !== "")
     );
-    console.log(`[Parser] Retry rows: ${result.data.length}`);
+    console.log(`[Parser] Retry rows (after empty filter): ${filtered.length}`);
+    result.data = filtered;
   }
 
   if (result.data.length === 0) {
@@ -203,15 +192,15 @@ export function parseCsvContent(
     return { probateLeads: [], foreclosureLeads: [] };
   }
 
-  // Log detected headers
-  const headers = result.meta.fields ?? Object.keys(result.data[0] ?? {});
+  const headers = result.meta?.fields ?? Object.keys(result.data[0] ?? {});
   console.log(`[Parser] Headers: ${JSON.stringify(headers)}`);
+  console.log(`[Parser] Sample row[0]: ${JSON.stringify(result.data[0]).slice(0, 300)}`);
 
-  // ---- Step 3: Group by case number ----
+  // Step 3: group by case number
   const groups = groupByCaseNumber(result.data);
   console.log(`[Parser] Unique cases: ${groups.size}`);
 
-  // ---- Step 4: Build lead objects ----
+  // Step 4: build lead objects
   const probateLeads: ProbateLead[] = [];
   const foreclosureLeads: ForeclosureLead[] = [];
 
@@ -225,6 +214,7 @@ export function parseCsvContent(
     }
 
     const filingDate = parseDate(anchor["filingdate"]);
+    const partyTypes = caseRows.map((r) => r["partytype"]).join(",");
 
     const attorneyRaw =
       caseRows
@@ -235,7 +225,11 @@ export function parseCsvContent(
     if (isProbateLead(caseType)) {
       const decedentRow = pickParty(caseRows, "Decedent");
       const petitionerRow = pickParty(
-        caseRows, "Petitioner", "Trustee", "Subject", "Ward"
+        caseRows,
+        "Petitioner",
+        "Trustee",
+        "Subject",
+        "Ward"
       );
       const addressRow = petitionerRow ?? decedentRow ?? anchor;
       const { address, city, state, zip } = parseAddress(
@@ -259,7 +253,7 @@ export function parseCsvContent(
       };
 
       console.log(
-        `[Parser] Probate lead created: ${caseNumber} | type="${lead.case_type}" | deceased="${lead.deceased_name}" | petitioner="${lead.petitioner}"`
+        `[Parser] Probate lead created: ${caseNumber} | "${lead.case_type}" | deceased="${lead.deceased_name}" | petitioner="${lead.petitioner}" | parties=[${partyTypes}]`
       );
       probateLeads.push(lead);
     } else if (isForeclosureLead(caseType)) {
@@ -287,19 +281,19 @@ export function parseCsvContent(
       };
 
       console.log(
-        `[Parser] Foreclosure lead created: ${caseNumber} | type="${lead.case_type}" | plaintiff="${lead.plaintiff}" | defendant="${lead.defendant}"`
+        `[Parser] Foreclosure lead created: ${caseNumber} | "${lead.case_type}" | plaintiff="${lead.plaintiff}" | defendant="${lead.defendant}" | parties=[${partyTypes}]`
       );
       foreclosureLeads.push(lead);
     } else {
       console.log(
-        `[Parser] SKIP ${caseNumber}: "${caseType}" — not a probate or foreclosure lead`
+        `[Parser] SKIP ${caseNumber}: "${caseType}" — not probate or foreclosure`
       );
     }
   }
 
   console.log(`[Parser] Final probate leads: ${probateLeads.length}`);
   console.log(`[Parser] Final foreclosure leads: ${foreclosureLeads.length}`);
-  console.log(`[Parser] === END ${filename} ===`);
+  console.log(`[Parser] ===== END ${filename} =====`);
 
   return { probateLeads, foreclosureLeads };
 }
