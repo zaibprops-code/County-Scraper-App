@@ -1,26 +1,24 @@
 // ============================================================
 // CSV Parser — Hillsborough County real CSV structure.
 //
-// CONFIRMED REAL COLUMN LAYOUT (both Civil and Probate):
-//   CaseCategory, CaseTypeDescription, CaseNumber, Title,
-//   FilingDate, PartyType, FirstName, MiddleName,
-//   LastName/CompanyName, [DateofDeath - probate only],
-//   PartyAddress, Attorney
-//
-// After transformHeader:
+// CONFIRMED COLUMN LAYOUT (both Civil and Probate after transformHeader):
 //   casecategory, casetypedescription, casenumber, title,
 //   filingdate, partytype, firstname, middlename,
-//   lastname_companyname, [dateofdeath], partyaddress, attorney
+//   lastname_companyname, [dateofdeath - probate only],
+//   partyaddress, attorney
 //
-// KEY FACTS (confirmed from real files):
-//   - UTF-8-SIG encoding (BOM: \uFEFF at start)
+// KEY FACTS (confirmed from real production files):
+//   - UTF-8-SIG encoding (BOM \uFEFF at byte 0)
 //   - CRLF line endings
 //   - Comma delimited, values quoted with "
 //   - Multiple rows per case (one per party)
-//   - PartyType: Petitioner, Decedent, Plaintiff, Defendant,
-//     Beneficiary, Trustee, Caveator, Subject
-//   - PartyAddress is a single string: "123 St, City, FL 33601"
-//   - Attorney field may contain "No Attorney"
+//   - PartyType values (probate):  Petitioner, Decedent, Beneficiary,
+//                                  Trustee, Caveator, Ward, Next of Kin,
+//                                  Subject, Minor
+//   - PartyType values (civil):    Plaintiff, Defendant,
+//                                  Petitioner, Respondent
+//   - PartyAddress: single string "123 St, City, FL 33601"
+//   - Attorney: may be "No Attorney"
 // ============================================================
 
 import Papa from "papaparse";
@@ -37,29 +35,49 @@ import type { ProbateLead, ForeclosureLead } from "@/types/leads";
 type RawRow = Record<string, string>;
 
 // ---- Header transform -----------------------------------------
-// "LastName/CompanyName" → "lastname_companyname"
-// "CaseTypeDescription"  → "casetypedescription"
-// "DateofDeath"          → "dateofdeath"
 function transformHeader(h: string): string {
-  return h
-    .trim()
-    .toLowerCase()
-    .replace(/[\s\-\/]+/g, "_");
+  return h.trim().toLowerCase().replace(/[\s\-\/]+/g, "_");
 }
 
-// ---- Strip BOM and normalize line endings ---------------------
-function sanitizeCsvString(raw: string): string {
-  // Strip UTF-8 BOM (\uFEFF) if present — Hillsborough CSVs are UTF-8-SIG
-  let s = raw.replace(/^\uFEFF/, "");
-  // Normalize CRLF → LF so PapaParse handles consistently
-  s = s.replace(/\r\n/g, "\n");
-  // Normalize bare CR → LF
-  s = s.replace(/\r/g, "\n");
+// ---- Sanitize input -------------------------------------------
+// Forces to string (guards against Buffer arriving from axios),
+// strips UTF-8 BOM, normalises line endings.
+function sanitize(input: unknown): string {
+  let s: string;
+
+  if (typeof input === "string") {
+    s = input;
+  } else if (Buffer.isBuffer(input)) {
+    // axios responseType:"arraybuffer" decoded by downloader as Buffer
+    s = (input as Buffer).toString("utf8");
+    console.log("[Parser] Input was Buffer — converted to utf8 string");
+  } else if (input instanceof ArrayBuffer) {
+    s = Buffer.from(input).toString("utf8");
+    console.log("[Parser] Input was ArrayBuffer — converted to utf8 string");
+  } else if (input instanceof Uint8Array) {
+    s = Buffer.from(input).toString("utf8");
+    console.log("[Parser] Input was Uint8Array — converted to utf8 string");
+  } else {
+    // Last resort
+    s = String(input);
+    console.log(`[Parser] Input was ${typeof input} — coerced with String()`);
+  }
+
+  // Strip UTF-8 BOM (\uFEFF = 0xEF 0xBB 0xBF)
+  if (s.charCodeAt(0) === 0xfeff) {
+    s = s.slice(1);
+    console.log("[Parser] Stripped BOM");
+  }
+
+  // Normalise CRLF → LF, bare CR → LF
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
   return s;
 }
 
 // ---- Name assembly --------------------------------------------
-function assembleName(row: RawRow): string | null {
+function assembleName(row: RawRow | null): string | null {
+  if (!row) return null;
   const first = cleanString(row["firstname"]) ?? "";
   const middle = cleanString(row["middlename"]) ?? "";
   const last = cleanString(row["lastname_companyname"]) ?? "";
@@ -68,8 +86,8 @@ function assembleName(row: RawRow): string | null {
 }
 
 // ---- Address parsing ------------------------------------------
-// Format observed: "6618 Travis blvd., Tampa, FL 33610"
-// Or multi-part:   "801 N. Orange Avenue, Suite 500, Orlando, FL 32801"
+// Format: "123 Main St, Tampa, FL 33610"
+//         "801 N. Orange Ave, Suite 500, Orlando, FL 32801"
 function parseAddress(raw: string | undefined): {
   address: string | null;
   city: string | null;
@@ -83,6 +101,7 @@ function parseAddress(raw: string | undefined): {
   const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
 
   if (parts.length >= 3) {
+    // Everything except last two parts = street address
     const streetParts = parts.slice(0, parts.length - 2);
     const address = cleanString(streetParts.join(", "));
     const city = cleanString(parts[parts.length - 2]);
@@ -117,7 +136,7 @@ function groupByCaseNumber(rows: RawRow[]): Map<string, RawRow[]> {
   return groups;
 }
 
-// ---- Pick a party row by PartyType priority ------------------
+// ---- Pick party row by PartyType priority --------------------
 function pickParty(rows: RawRow[], ...types: string[]): RawRow | null {
   for (const type of types) {
     const found = rows.find(
@@ -131,122 +150,82 @@ function pickParty(rows: RawRow[], ...types: string[]): RawRow | null {
 
 // ---- Main export ----------------------------------------------
 export function parseCsvContent(
-  csvContent: string,
+  csvContent: unknown,
   filename: string
 ): { probateLeads: ProbateLead[]; foreclosureLeads: ForeclosureLead[] } {
 
-  // ---- DEBUG: log raw content info BEFORE sanitize ----
-  console.log(`[Parser] RAW INPUT ${filename}:`);
-  console.log(`  length: ${csvContent.length} chars`);
-  console.log(`  first char codes: ${[...csvContent.slice(0, 6)].map(c => c.charCodeAt(0)).join(", ")}`);
-  console.log(`  starts with BOM: ${csvContent.charCodeAt(0) === 0xFEFF}`);
-  console.log(`  CRLF count: ${(csvContent.match(/\r\n/g) ?? []).length}`);
-  console.log(`  LF count: ${(csvContent.match(/(?<!\r)\n/g) ?? []).length}`);
-  console.log(`  CR count: ${(csvContent.match(/\r(?!\n)/g) ?? []).length}`);
-  console.log(`  first 150 chars: ${JSON.stringify(csvContent.slice(0, 150))}`);
+  // ---- Step 1: Sanitize ----
+  console.log(`[Parser] === START ${filename} ===`);
+  console.log(`[Parser] Input type: ${typeof csvContent}, isBuffer: ${Buffer.isBuffer(csvContent)}`);
+  console.log(`[Parser] Input length: ${typeof csvContent === "string" ? (csvContent as string).length : "n/a"}`);
 
-  // ---- Sanitize: strip BOM, normalize line endings ----
-  const sanitized = sanitizeCsvString(csvContent);
+  const sanitized = sanitize(csvContent);
 
-  console.log(`[Parser] SANITIZED ${filename}:`);
-  console.log(`  length: ${sanitized.length} chars`);
-  console.log(`  first char codes: ${[...sanitized.slice(0, 6)].map(c => c.charCodeAt(0)).join(", ")}`);
-  console.log(`  first 150 chars: ${JSON.stringify(sanitized.slice(0, 150))}`);
+  console.log(`[Parser] Sanitized length: ${sanitized.length} chars`);
+  console.log(`[Parser] First 120 chars: ${JSON.stringify(sanitized.slice(0, 120))}`);
 
-  // ---- Parse attempt 1: standard config ----
-  let result = Papa.parse<RawRow>(sanitized, {
+  if (!sanitized || sanitized.trim().length === 0) {
+    console.error(`[Parser] ABORT ${filename}: sanitized content is empty`);
+    return { probateLeads: [], foreclosureLeads: [] };
+  }
+
+  // ---- Step 2: Parse CSV ----
+  const result = Papa.parse<RawRow>(sanitized, {
     header: true,
     skipEmptyLines: true,
     transformHeader,
     delimiter: ",",
   });
 
-  console.log(`[Parser] ATTEMPT-1 ${filename}: rows=${result.data.length} errors=${result.errors.length}`);
+  console.log(`[Parser] Rows parsed: ${result.data.length}`);
+  console.log(`[Parser] Parse errors: ${result.errors.length}`);
   if (result.errors.length > 0) {
-    console.log(`[Parser] ATTEMPT-1 errors:`, JSON.stringify(result.errors.slice(0, 3)));
-  }
-  if (result.meta?.fields) {
-    console.log(`[Parser] ATTEMPT-1 headers: ${JSON.stringify(result.meta.fields)}`);
+    console.warn(`[Parser] First 3 errors:`, JSON.stringify(result.errors.slice(0, 3)));
   }
 
-  // ---- Parse attempt 2: if 0 rows, try without skipEmptyLines ----
   if (result.data.length === 0) {
-    console.log(`[Parser] ATTEMPT-2 trying skipEmptyLines:false`);
-    result = Papa.parse<RawRow>(sanitized, {
+    // Attempt 2: no skipEmptyLines
+    console.warn(`[Parser] Retrying without skipEmptyLines...`);
+    const r2 = Papa.parse<RawRow>(sanitized, {
       header: true,
       skipEmptyLines: false,
       transformHeader,
       delimiter: ",",
     });
-    console.log(`[Parser] ATTEMPT-2 rows=${result.data.length}`);
-    if (result.meta?.fields) {
-      console.log(`[Parser] ATTEMPT-2 headers: ${JSON.stringify(result.meta.fields)}`);
-    }
-    // Re-filter empty rows manually
-    result.data = result.data.filter((r) =>
-      Object.values(r).some((v) => v && v.trim() !== "")
+    result.data = r2.data.filter((row) =>
+      Object.values(row).some((v) => v && v.trim() !== "")
     );
-    console.log(`[Parser] ATTEMPT-2 after empty filter: rows=${result.data.length}`);
+    console.log(`[Parser] Retry rows: ${result.data.length}`);
   }
 
-  // ---- Parse attempt 3: no transformHeader, raw keys ----
   if (result.data.length === 0) {
-    console.log(`[Parser] ATTEMPT-3 trying no transformHeader`);
-    const raw3 = Papa.parse<RawRow>(sanitized, {
-      header: true,
-      skipEmptyLines: true,
-      delimiter: ",",
-    });
-    console.log(`[Parser] ATTEMPT-3 rows=${raw3.data.length}`);
-    if (raw3.meta?.fields) {
-      console.log(`[Parser] ATTEMPT-3 raw headers: ${JSON.stringify(raw3.meta.fields)}`);
-    }
-    if (raw3.data.length > 0) {
-      // Map raw headers to transformed manually
-      const fieldMap: Record<string, string> = {};
-      (raw3.meta.fields ?? []).forEach((f) => {
-        fieldMap[f] = transformHeader(f);
-      });
-      result.data = raw3.data.map((row) => {
-        const mapped: RawRow = {};
-        for (const [origKey, val] of Object.entries(row)) {
-          mapped[fieldMap[origKey] ?? transformHeader(origKey)] = val;
-        }
-        return mapped;
-      });
-      result.meta.fields = Object.values(fieldMap);
-      console.log(`[Parser] ATTEMPT-3 after manual transform: rows=${result.data.length}`);
-    }
-  }
-
-  const rows: RawRow[] = result.data;
-
-  if (rows.length === 0) {
-    console.error(`[Parser] ALL ATTEMPTS FAILED for ${filename}. No rows parsed.`);
+    console.error(`[Parser] ABORT ${filename}: zero rows after all parse attempts`);
     return { probateLeads: [], foreclosureLeads: [] };
   }
 
-  if (rows.length > 0) {
-    console.log(`[Parser] SUCCESS ${filename}: ${rows.length} raw rows`);
-    console.log(`[Parser] Sample row keys: ${JSON.stringify(Object.keys(rows[0]))}`);
-    console.log(`[Parser] Sample row: ${JSON.stringify(rows[0]).slice(0, 300)}`);
-  }
+  // Log detected headers
+  const headers = result.meta.fields ?? Object.keys(result.data[0] ?? {});
+  console.log(`[Parser] Headers: ${JSON.stringify(headers)}`);
 
-  // ---- Group rows by case number ----
-  const groups = groupByCaseNumber(rows);
-  console.log(`[Parser] ${filename}: ${groups.size} unique case numbers`);
+  // ---- Step 3: Group by case number ----
+  const groups = groupByCaseNumber(result.data);
+  console.log(`[Parser] Unique cases: ${groups.size}`);
 
+  // ---- Step 4: Build lead objects ----
   const probateLeads: ProbateLead[] = [];
   const foreclosureLeads: ForeclosureLead[] = [];
 
   for (const [caseNumber, caseRows] of groups) {
     const anchor = caseRows[0];
     const caseType = cleanString(anchor["casetypedescription"]);
-    if (!caseType) continue;
+
+    if (!caseType) {
+      console.log(`[Parser] SKIP ${caseNumber}: empty casetypedescription`);
+      continue;
+    }
 
     const filingDate = parseDate(anchor["filingdate"]);
 
-    // Attorney: first non-empty, non-"No Attorney" value across all party rows
     const attorneyRaw =
       caseRows
         .map((r) => cleanString(r["attorney"]))
@@ -256,21 +235,18 @@ export function parseCsvContent(
     if (isProbateLead(caseType)) {
       const decedentRow = pickParty(caseRows, "Decedent");
       const petitionerRow = pickParty(
-        caseRows,
-        "Petitioner",
-        "Trustee",
-        "Subject"
+        caseRows, "Petitioner", "Trustee", "Subject", "Ward"
       );
       const addressRow = petitionerRow ?? decedentRow ?? anchor;
       const { address, city, state, zip } = parseAddress(
         addressRow["partyaddress"]
       );
 
-      probateLeads.push({
+      const lead: ProbateLead = {
         case_number: caseNumber,
         filing_date: filingDate,
-        deceased_name: decedentRow ? assembleName(decedentRow) : null,
-        petitioner: petitionerRow ? assembleName(petitionerRow) : null,
+        deceased_name: assembleName(decedentRow),
+        petitioner: assembleName(petitionerRow),
         attorney,
         address,
         city,
@@ -280,7 +256,12 @@ export function parseCsvContent(
         case_type: normalizeCaseType(caseType),
         source_file: filename,
         raw_data: anchor as Record<string, unknown>,
-      });
+      };
+
+      console.log(
+        `[Parser] Probate lead created: ${caseNumber} | type="${lead.case_type}" | deceased="${lead.deceased_name}" | petitioner="${lead.petitioner}"`
+      );
+      probateLeads.push(lead);
     } else if (isForeclosureLead(caseType)) {
       const plaintiffRow = pickParty(caseRows, "Plaintiff", "Petitioner");
       const defendantRow = pickParty(caseRows, "Defendant", "Respondent");
@@ -289,11 +270,11 @@ export function parseCsvContent(
         addressRow["partyaddress"]
       );
 
-      foreclosureLeads.push({
+      const lead: ForeclosureLead = {
         case_number: caseNumber,
         filing_date: filingDate,
-        plaintiff: plaintiffRow ? assembleName(plaintiffRow) : null,
-        defendant: defendantRow ? assembleName(defendantRow) : null,
+        plaintiff: assembleName(plaintiffRow),
+        defendant: assembleName(defendantRow),
         attorney,
         address,
         city,
@@ -303,13 +284,22 @@ export function parseCsvContent(
         case_type: normalizeCaseType(caseType),
         source_file: filename,
         raw_data: anchor as Record<string, unknown>,
-      });
+      };
+
+      console.log(
+        `[Parser] Foreclosure lead created: ${caseNumber} | type="${lead.case_type}" | plaintiff="${lead.plaintiff}" | defendant="${lead.defendant}"`
+      );
+      foreclosureLeads.push(lead);
+    } else {
+      console.log(
+        `[Parser] SKIP ${caseNumber}: "${caseType}" — not a probate or foreclosure lead`
+      );
     }
   }
 
-  console.log(
-    `[Parser] FINAL ${filename} → ${probateLeads.length} probate, ${foreclosureLeads.length} foreclosure leads`
-  );
+  console.log(`[Parser] Final probate leads: ${probateLeads.length}`);
+  console.log(`[Parser] Final foreclosure leads: ${foreclosureLeads.length}`);
+  console.log(`[Parser] === END ${filename} ===`);
 
   return { probateLeads, foreclosureLeads };
 }
