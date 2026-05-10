@@ -1,7 +1,7 @@
 // ============================================================
 // /api/leads — Paginated, filtered lead query
 // GET /api/leads?type=all&search=&dateFrom=&dateTo=&page=1
-// No default date filter — returns all records unless dates provided.
+// Returns ALL records when no filters applied.
 // ============================================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -21,16 +21,23 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const page = Math.max(1, parseInt(searchParams.get("page") ?? "1", 10));
   const offset = (page - 1) * PAGE_SIZE;
 
+  console.log(
+    `[LeadsAPI] GET type=${type} search="${search}" dateFrom="${dateFrom}" dateTo="${dateTo}" page=${page}`
+  );
+
   try {
     const [probateResult, foreclosureResult] = await Promise.all([
       type === "all" || type === "probate"
         ? queryProbate(search, dateFrom, dateTo, offset, PAGE_SIZE)
         : { data: [], count: 0 },
-
       type === "all" || type === "foreclosure"
         ? queryForeclosure(search, dateFrom, dateTo, offset, PAGE_SIZE)
         : { data: [], count: 0 },
     ]);
+
+    console.log(
+      `[LeadsAPI] Response: probate=${probateResult.count} total (${probateResult.data.length} this page), foreclosure=${foreclosureResult.count} total (${foreclosureResult.data.length} this page)`
+    );
 
     return NextResponse.json({
       probate: probateResult.data,
@@ -42,7 +49,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error("[Leads API] Error:", msg);
+    console.error("[LeadsAPI] Error:", msg);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
@@ -74,9 +81,11 @@ async function queryProbate(
 
   const { data, count, error } = await q;
   if (error) {
-    console.error("[Leads API] Probate query error:", error);
+    console.error("[LeadsAPI] Probate query error:", JSON.stringify(error));
     throw error;
   }
+
+  console.log(`[LeadsAPI] Probate query: count=${count} rows=${data?.length}`);
   return { data: data ?? [], count: count ?? 0 };
 }
 
@@ -107,8 +116,10 @@ async function queryForeclosure(
 
   const { data, count, error } = await q;
   if (error) {
-    console.error("[Leads API] Foreclosure query error:", error);
+    console.error("[LeadsAPI] Foreclosure query error:", JSON.stringify(error));
     throw error;
   }
+
+  console.log(`[LeadsAPI] Foreclosure query: count=${count} rows=${data?.length}`);
   return { data: data ?? [], count: count ?? 0 };
 }
