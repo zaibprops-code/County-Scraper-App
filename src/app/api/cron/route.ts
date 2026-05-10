@@ -1,6 +1,6 @@
 // ============================================================
 // /api/cron — Daily ingestion pipeline
-// Auth check disabled for MVP/testing.
+// Auth disabled for MVP testing.
 // ============================================================
 
 import { NextResponse } from "next/server";
@@ -13,11 +13,14 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 export async function GET(): Promise<NextResponse> {
-  console.log("[Cron] ▶ Starting daily lead ingestion pipeline...");
-  const startTime = Date.now();
+  console.log("[Cron] ▶ Pipeline start");
+  const t0 = Date.now();
 
   try {
+    // Step 1: discover + download new CSV files
     const newFiles = await downloadNewFiles();
+
+    console.log(`[Cron] Files returned by downloader: ${newFiles.length}`);
 
     if (newFiles.length === 0) {
       const result: CronResult = {
@@ -25,9 +28,9 @@ export async function GET(): Promise<NextResponse> {
         filesProcessed: 0,
         probateLeadsInserted: 0,
         foreclosureLeadsInserted: 0,
-        message: "No new files found. Everything is up to date.",
+        message: "No new files found.",
       };
-      console.log("[Cron] ✓ No new files.");
+      console.log("[Cron] ✓ Nothing to process.");
       return NextResponse.json(result);
     }
 
@@ -35,19 +38,30 @@ export async function GET(): Promise<NextResponse> {
     let totalForeclosure = 0;
 
     for (const file of newFiles) {
-      console.log(`[Cron] Processing: ${file.filename}`);
+      console.log(`[Cron] Processing file: ${file.filename} (${file.csvContent.length} chars)`);
 
       try {
+        // Step 2: parse CSV content in memory
         const { probateLeads, foreclosureLeads } = parseCsvContent(
           file.csvContent,
           file.filename
         );
 
+        console.log(
+          `[Cron] ${file.filename}: parsed ${probateLeads.length} probate, ${foreclosureLeads.length} foreclosure`
+        );
+
+        // Step 3: store leads
         const [probateCount, foreclosureCount] = await Promise.all([
           storeProbateLeads(probateLeads),
           storeForeclosureLeads(foreclosureLeads),
         ]);
 
+        console.log(
+          `[Cron] ${file.filename}: stored ${probateCount} probate, ${foreclosureCount} foreclosure`
+        );
+
+        // Step 4: mark file processed
         await markFileProcessed(
           {
             filename: file.filename,
@@ -60,25 +74,27 @@ export async function GET(): Promise<NextResponse> {
 
         totalProbate += probateCount;
         totalForeclosure += foreclosureCount;
-      } catch (fileError) {
-        console.error(`[Cron] Error processing ${file.filename}:`, fileError);
+      } catch (fileErr) {
+        const msg = fileErr instanceof Error ? fileErr.message : String(fileErr);
+        console.error(`[Cron] ✗ Error processing ${file.filename}: ${msg}`);
+        // Continue with remaining files
       }
     }
 
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     const result: CronResult = {
       success: true,
       filesProcessed: newFiles.length,
       probateLeadsInserted: totalProbate,
       foreclosureLeadsInserted: totalForeclosure,
-      message: `Pipeline completed in ${elapsed}s`,
+      message: `Done in ${elapsed}s`,
     };
 
-    console.log("[Cron] ✓ Done.", result);
+    console.log(`[Cron] ✓ Complete in ${elapsed}s:`, result);
     return NextResponse.json(result);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("[Cron] ✗ Pipeline failed:", message);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[Cron] ✗ Fatal pipeline error:", message);
     return NextResponse.json(
       {
         success: false,
