@@ -4,6 +4,7 @@
 
 export type SourceType = "probate" | "civil";
 export type LeadFilterType = "all" | "probate" | "foreclosure";
+export type PropertyMatchStatus = "matched" | "no_match" | "error" | null;
 
 export interface ProbateLead {
   id?: number;
@@ -21,6 +22,12 @@ export interface ProbateLead {
   source_file: string;
   raw_data?: Record<string, unknown>;
   created_at?: string;
+  // Property match fields (populated by Match Probate Properties)
+  matched_property_address: string | null;
+  matched_property_city: string | null;
+  matched_property_state: string | null;
+  matched_property_zip: string | null;
+  property_match_status: PropertyMatchStatus;
 }
 
 export interface ForeclosureLead {
@@ -96,8 +103,26 @@ export interface ClearResult {
   error?: string;
 }
 
-// Ingestion request sent from frontend to /api/cron
 export interface IngestRequest {
-  dateFrom: string; // YYYY-MM-DD
-  dateTo: string;   // YYYY-MM-DD
+  dateFrom: string;
+  dateTo: string;
+}
+
+// Property match result types
+export interface PropertyMatchResult {
+  success: boolean;
+  totalProcessed: number;
+  matched: number;
+  noMatch: number;
+  errors: number;
+  message?: string;
+  error?: string;
+}
+
+export interface HcpaProperty {
+  ownerName: string;
+  siteAddress: string;
+  siteCity: string;
+  siteState: string;
+  siteZip: string;
 }
