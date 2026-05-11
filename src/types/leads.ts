@@ -1,9 +1,8 @@
 // ============================================================
-// TypeScript types for all lead data structures
+// TypeScript types — Hillsborough County Lead Generator
 // ============================================================
 
 export type SourceType = "probate" | "civil";
-
 export type LeadFilterType = "all" | "probate" | "foreclosure";
 
 export interface ProbateLead {
@@ -86,7 +85,19 @@ export interface DiscoveredFile {
 
 export interface DownloadResult {
   filename: string;
-  localPath: string;
+  csvContent: string;
   sourceType: SourceType;
   fileDate: string | null;
+}
+
+export interface ClearResult {
+  success: boolean;
+  message: string;
+  error?: string;
+}
+
+// Ingestion request sent from frontend to /api/cron
+export interface IngestRequest {
+  dateFrom: string; // YYYY-MM-DD
+  dateTo: string;   // YYYY-MM-DD
 }
