@@ -22,12 +22,13 @@ export interface ProbateLead {
   source_file: string;
   raw_data?: Record<string, unknown>;
   created_at?: string;
-  // Property match fields (populated by Match Probate Properties)
-  matched_property_address: string | null;
-  matched_property_city: string | null;
-  matched_property_state: string | null;
-  matched_property_zip: string | null;
-  property_match_status: PropertyMatchStatus;
+  // Property match fields — optional so parser.ts does not need to set them.
+  // Populated later by /api/match-properties.
+  matched_property_address?: string | null;
+  matched_property_city?: string | null;
+  matched_property_state?: string | null;
+  matched_property_zip?: string | null;
+  property_match_status?: PropertyMatchStatus;
 }
 
 export interface ForeclosureLead {
@@ -108,7 +109,6 @@ export interface IngestRequest {
   dateTo: string;
 }
 
-// Property match result types
 export interface PropertyMatchResult {
   success: boolean;
   totalProcessed: number;
