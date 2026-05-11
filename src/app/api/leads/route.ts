@@ -1,10 +1,7 @@
 // ============================================================
 // /api/leads — Paginated, filtered lead query
 // GET /api/leads?type=all&search=&dateFrom=&dateTo=&page=1
-//
-// IMPORTANT: Uses supabaseAdmin (service role key) for reads.
-// The anon key is blocked by Supabase RLS on these tables.
-// Inserts already use service role — reads must too.
+// Uses service-role client to bypass Supabase RLS.
 // ============================================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -24,32 +21,18 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const page = Math.max(1, parseInt(searchParams.get("page") ?? "1", 10));
   const offset = (page - 1) * PAGE_SIZE;
 
-  console.log(
-    `[LeadsAPI] Request: type=${type} search="${search}" dateFrom="${dateFrom}" dateTo="${dateTo}" page=${page} offset=${offset}`
-  );
+  console.log(`[LeadsAPI] type=${type} search="${search}" dateFrom="${dateFrom}" dateTo="${dateTo}" page=${page}`);
 
-  // Use admin client so RLS does not silently block reads
   const admin = getSupabaseAdmin();
 
   try {
-    // Quick sanity check — log total row counts before filtering
-    const [probateSanity, foreclosureSanity] = await Promise.all([
+    // Sanity: log unfiltered totals
+    const [sanityP, sanityF] = await Promise.all([
       admin.from("probate_leads").select("id", { count: "exact", head: true }),
       admin.from("foreclosure_leads").select("id", { count: "exact", head: true }),
     ]);
+    console.log(`[LeadsAPI] DB totals: probate=${sanityP.count ?? "err"} foreclosure=${sanityF.count ?? "err"}`);
 
-    console.log(
-      `[LeadsAPI] DB totals (unfiltered): probate=${probateSanity.count ?? "err"} foreclosure=${foreclosureSanity.count ?? "err"}`
-    );
-
-    if (probateSanity.error) {
-      console.error("[LeadsAPI] Sanity check probate error:", JSON.stringify(probateSanity.error));
-    }
-    if (foreclosureSanity.error) {
-      console.error("[LeadsAPI] Sanity check foreclosure error:", JSON.stringify(foreclosureSanity.error));
-    }
-
-    // Run filtered queries
     const [probateResult, foreclosureResult] = await Promise.all([
       type === "all" || type === "probate"
         ? queryProbate(admin, search, dateFrom, dateTo, offset, PAGE_SIZE)
@@ -59,39 +42,25 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         : { data: [], count: 0 },
     ]);
 
-    const response = {
+    console.log(`[LeadsAPI] Result: probateTotal=${probateResult.count} foreclosureTotal=${foreclosureResult.count}`);
+
+    return NextResponse.json({
       probate: probateResult.data,
       foreclosure: foreclosureResult.data,
       probateTotal: probateResult.count,
       foreclosureTotal: foreclosureResult.count,
       page,
       pageSize: PAGE_SIZE,
-    };
-
-    console.log(
-      `[LeadsAPI] Response: probateTotal=${response.probateTotal} (${response.probate.length} rows) foreclosureTotal=${response.foreclosureTotal} (${response.foreclosure.length} rows)`
-    );
-
-    return NextResponse.json(response);
+    });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error("[LeadsAPI] Fatal error:", msg);
+    console.error("[LeadsAPI] Error:", msg);
     return NextResponse.json(
-      {
-        error: msg,
-        probate: [],
-        foreclosure: [],
-        probateTotal: 0,
-        foreclosureTotal: 0,
-        page,
-        pageSize: PAGE_SIZE,
-      },
+      { error: msg, probate: [], foreclosure: [], probateTotal: 0, foreclosureTotal: 0, page, pageSize: PAGE_SIZE },
       { status: 500 }
     );
   }
 }
-
-// ---- Query helpers --------------------------------------------
 
 type AdminClient = ReturnType<typeof getSupabaseAdmin>;
 
@@ -102,7 +71,7 @@ async function queryProbate(
   dateTo: string,
   offset: number,
   limit: number
-): Promise<{ data: unknown[]; count: number }> {
+) {
   let q = admin
     .from("probate_leads")
     .select(
@@ -113,25 +82,13 @@ async function queryProbate(
     .order("id", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (search) {
-    q = q.or(
-      `deceased_name.ilike.%${search}%,case_number.ilike.%${search}%,petitioner.ilike.%${search}%,attorney.ilike.%${search}%`
-    );
-  }
+  if (search) q = q.or(`deceased_name.ilike.%${search}%,case_number.ilike.%${search}%,petitioner.ilike.%${search}%,attorney.ilike.%${search}%`);
   if (dateFrom) q = q.gte("filing_date", dateFrom);
   if (dateTo) q = q.lte("filing_date", dateTo);
 
   const { data, count, error } = await q;
-
-  if (error) {
-    console.error("[LeadsAPI] Probate query error:", JSON.stringify(error));
-    throw new Error(`Probate query failed: ${error.message}`);
-  }
-
-  console.log(
-    `[LeadsAPI] Probate query OK: count=${count} rows=${data?.length ?? 0}`
-  );
-
+  if (error) { console.error("[LeadsAPI] Probate error:", error); throw new Error(error.message); }
+  console.log(`[LeadsAPI] Probate: count=${count} rows=${data?.length ?? 0}`);
   return { data: data ?? [], count: count ?? 0 };
 }
 
@@ -142,7 +99,7 @@ async function queryForeclosure(
   dateTo: string,
   offset: number,
   limit: number
-): Promise<{ data: unknown[]; count: number }> {
+) {
   let q = admin
     .from("foreclosure_leads")
     .select(
@@ -153,24 +110,12 @@ async function queryForeclosure(
     .order("id", { ascending: false })
     .range(offset, offset + limit - 1);
 
-  if (search) {
-    q = q.or(
-      `defendant.ilike.%${search}%,plaintiff.ilike.%${search}%,case_number.ilike.%${search}%,attorney.ilike.%${search}%,case_type.ilike.%${search}%`
-    );
-  }
+  if (search) q = q.or(`defendant.ilike.%${search}%,plaintiff.ilike.%${search}%,case_number.ilike.%${search}%,attorney.ilike.%${search}%,case_type.ilike.%${search}%`);
   if (dateFrom) q = q.gte("filing_date", dateFrom);
   if (dateTo) q = q.lte("filing_date", dateTo);
 
   const { data, count, error } = await q;
-
-  if (error) {
-    console.error("[LeadsAPI] Foreclosure query error:", JSON.stringify(error));
-    throw new Error(`Foreclosure query failed: ${error.message}`);
-  }
-
-  console.log(
-    `[LeadsAPI] Foreclosure query OK: count=${count} rows=${data?.length ?? 0}`
-  );
-
+  if (error) { console.error("[LeadsAPI] Foreclosure error:", error); throw new Error(error.message); }
+  console.log(`[LeadsAPI] Foreclosure: count=${count} rows=${data?.length ?? 0}`);
   return { data: data ?? [], count: count ?? 0 };
 }
