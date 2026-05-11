@@ -5,15 +5,22 @@ import FilterBar from "@/components/FilterBar";
 import LeadsTable from "@/components/LeadsTable";
 import ExportButtons from "@/components/ExportButtons";
 import StatCard from "@/components/StatCard";
-import { FiltersState, LeadsApiResponse, ProbateLead, ForeclosureLead } from "@/types/leads";
+import {
+  FiltersState,
+  LeadsApiResponse,
+  ProbateLead,
+  ForeclosureLead,
+} from "@/types/leads";
 
-const DEFAULT_FILTERS: FiltersState = {
-  search: "",
-  type: "all",
-  dateFrom: "",
-  dateTo: "",
-  page: 1,
-};
+// ---- Helpers --------------------------------------------------
+
+function todayLocal(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 
 const EMPTY_RESPONSE: LeadsApiResponse = {
   probate: [],
@@ -24,25 +31,47 @@ const EMPTY_RESPONSE: LeadsApiResponse = {
   pageSize: 50,
 };
 
-export default function Dashboard() {
-  const [filters, setFilters] = useState<FiltersState>(DEFAULT_FILTERS);
-  const [data, setData] = useState<LeadsApiResponse>(EMPTY_RESPONSE);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [cronLoading, setCronLoading] = useState(false);
-  const [cronMessage, setCronMessage] = useState<string | null>(null);
+const DEFAULT_FILTERS: FiltersState = {
+  search: "",
+  type: "all",
+  dateFrom: "",
+  dateTo: "",
+  page: 1,
+};
 
-  // Ref to abort stale in-flight requests
+// ---- Component ------------------------------------------------
+
+export default function Dashboard() {
+  const today = todayLocal();
+
+  // Ingestion date range (separate from display filters)
+  const [ingestFrom, setIngestFrom] = useState<string>(today);
+  const [ingestTo, setIngestTo] = useState<string>(today);
+
+  // Display filters
+  const [filters, setFilters] = useState<FiltersState>(DEFAULT_FILTERS);
+
+  // Data state
+  const [data, setData] = useState<LeadsApiResponse>(EMPTY_RESPONSE);
+  const [loading, setLoading] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  // Action states
+  const [cronLoading, setCronLoading] = useState(false);
+  const [cronMessage, setCronMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [clearLoading, setClearLoading] = useState(false);
+
   const abortRef = useRef<AbortController | null>(null);
 
+  // ---- Fetch leads from /api/leads ---------------------------
+
   const fetchLeads = useCallback(async (f: FiltersState) => {
-    // Cancel any previous in-flight request
     if (abortRef.current) abortRef.current.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
 
     setLoading(true);
-    setError(null);
+    setApiError(null);
 
     const params = new URLSearchParams({
       type: f.type,
@@ -52,85 +81,121 @@ export default function Dashboard() {
       page: String(f.page),
     });
 
-    const url = `/api/leads?${params.toString()}`;
-    console.log("[Frontend] Fetching:", url);
+    const url = `/api/leads?${params}`;
+    console.log("[Frontend] Fetching leads:", url);
 
     try {
-      const res = await fetch(url, { signal: controller.signal });
-
-      console.log("[Frontend] Response status:", res.status);
+      const res = await fetch(url, { signal: ctrl.signal });
 
       if (!res.ok) {
         const text = await res.text();
-        console.error("[Frontend] Non-OK response:", text);
-        setError(`API error ${res.status}`);
+        console.error("[Frontend] API error:", res.status, text);
+        setApiError(`API error ${res.status}`);
         setLoading(false);
         return;
       }
 
-      const json = await res.json() as LeadsApiResponse;
+      const json = await res.json();
+      console.log("[Frontend] Response — probateTotal:", json.probateTotal, "foreclosureTotal:", json.foreclosureTotal);
 
-      console.log("[Frontend] Response JSON keys:", Object.keys(json));
-      console.log("[Frontend] probateTotal:", json.probateTotal);
-      console.log("[Frontend] foreclosureTotal:", json.foreclosureTotal);
-      console.log("[Frontend] probate rows:", json.probate?.length ?? "undefined");
-      console.log("[Frontend] foreclosure rows:", json.foreclosure?.length ?? "undefined");
-
-      // Guard: ensure arrays are always arrays even if API returns unexpected shape
-      const safeData: LeadsApiResponse = {
-        probate: Array.isArray(json.probate) ? json.probate as ProbateLead[] : [],
-        foreclosure: Array.isArray(json.foreclosure) ? json.foreclosure as ForeclosureLead[] : [],
+      setData({
+        probate: Array.isArray(json.probate) ? (json.probate as ProbateLead[]) : [],
+        foreclosure: Array.isArray(json.foreclosure) ? (json.foreclosure as ForeclosureLead[]) : [],
         probateTotal: typeof json.probateTotal === "number" ? json.probateTotal : 0,
         foreclosureTotal: typeof json.foreclosureTotal === "number" ? json.foreclosureTotal : 0,
         page: typeof json.page === "number" ? json.page : 1,
         pageSize: typeof json.pageSize === "number" ? json.pageSize : 50,
-      };
-
-      console.log("[Frontend] Safe totals — probate:", safeData.probateTotal, "foreclosure:", safeData.foreclosureTotal);
-
-      setData(safeData);
+      });
     } catch (err) {
-      if ((err as Error).name === "AbortError") {
-        console.log("[Frontend] Request aborted (superseded by newer request)");
-        return;
-      }
+      if ((err as Error).name === "AbortError") return;
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[Frontend] Fetch error:", msg);
-      setError(msg);
+      setApiError(msg);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  // Fetch whenever filters change
+  // Fetch whenever display filters change
   useEffect(() => {
     fetchLeads(filters);
   }, [filters, fetchLeads]);
 
-  const handleManualCron = async () => {
+  // ---- Run Ingestion -----------------------------------------
+
+  const handleRunIngestion = async () => {
+    if (!ingestFrom) {
+      setCronMessage({ text: "Please select a start date.", ok: false });
+      return;
+    }
+
+    const from = ingestFrom;
+    const to = ingestTo || ingestFrom;
+
+    if (to < from) {
+      setCronMessage({ text: "End date must be on or after start date.", ok: false });
+      return;
+    }
+
     setCronLoading(true);
     setCronMessage(null);
+
+    const params = new URLSearchParams({ dateFrom: from, dateTo: to });
+    const url = `/api/cron?${params}`;
+    console.log("[Frontend] Triggering ingestion:", url);
+
     try {
-      console.log("[Frontend] Triggering ingestion...");
-      const res = await fetch("/api/cron");
+      const res = await fetch(url);
       const json = await res.json();
-      console.log("[Frontend] Cron response:", JSON.stringify(json));
+      console.log("[Frontend] Cron response:", json);
 
       if (json.success) {
-        setCronMessage(
-          `✓ Done! Files: ${json.filesProcessed} · Probate: ${json.probateLeadsInserted} · Foreclosure: ${json.foreclosureLeadsInserted}`
-        );
-        // Refresh leads after ingestion
-        fetchLeads(filters);
+        setCronMessage({
+          text: `✓ Done! Files: ${json.filesProcessed} · Probate: ${json.probateLeadsInserted} · Foreclosure: ${json.foreclosureLeadsInserted}${json.message ? " · " + json.message : ""}`,
+          ok: true,
+        });
+        // Refresh display with fresh data (no date filter — show everything just inserted)
+        setFilters({ ...DEFAULT_FILTERS });
       } else {
-        setCronMessage(`✗ ${json.error ?? json.message ?? "Unknown error"}`);
+        setCronMessage({ text: `✗ ${json.error ?? json.message ?? "Unknown error"}`, ok: false });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error("[Frontend] Cron error:", msg);
-      setCronMessage(`✗ ${msg}`);
+      setCronMessage({ text: `✗ ${msg}`, ok: false });
     } finally {
       setCronLoading(false);
+    }
+  };
+
+  // ---- Clear Records -----------------------------------------
+
+  const handleClearRecords = async () => {
+    const confirmed = window.confirm(
+      "Are you sure you want to delete ALL leads and processed files?\n\nThis cannot be undone."
+    );
+    if (!confirmed) return;
+
+    setClearLoading(true);
+    setCronMessage(null);
+    console.log("[Frontend] Clearing all records...");
+
+    try {
+      const res = await fetch("/api/clear", { method: "POST" });
+      const json = await res.json();
+      console.log("[Frontend] Clear response:", json);
+
+      if (json.success) {
+        setData(EMPTY_RESPONSE);
+        setFilters({ ...DEFAULT_FILTERS });
+        setCronMessage({ text: "✓ All records cleared.", ok: true });
+      } else {
+        setCronMessage({ text: `✗ Clear failed: ${json.error ?? json.message}`, ok: false });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setCronMessage({ text: `✗ ${msg}`, ok: false });
+    } finally {
+      setClearLoading(false);
     }
   };
 
@@ -138,9 +203,9 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
-      {/* ---- Header ---- */}
+      {/* ---- Header ----------------------------------------- */}
       <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-sm sticky top-0 z-20">
-        <div className="max-w-screen-xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-screen-xl mx-auto px-6 py-4 flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center text-white font-bold text-sm">
               H
@@ -155,50 +220,104 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <button
-            onClick={handleManualCron}
-            disabled={cronLoading}
-            className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg border border-slate-700 text-slate-300 hover:border-cyan-500 hover:text-cyan-400 transition disabled:opacity-50"
-          >
-            {cronLoading ? (
-              <>
-                <span className="w-3 h-3 border border-cyan-500 border-t-transparent rounded-full animate-spin" />
-                Ingesting…
-              </>
-            ) : (
-              <>
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Run Ingestion
-              </>
-            )}
-          </button>
+          {/* ---- Ingestion controls -------------------------- */}
+          <div className="flex items-end gap-3 flex-wrap">
+            {/* Date range inputs */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                From Date
+              </label>
+              <input
+                type="date"
+                value={ingestFrom}
+                onChange={(e) => setIngestFrom(e.target.value)}
+                disabled={cronLoading}
+                className="px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 disabled:opacity-50"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                To Date
+              </label>
+              <input
+                type="date"
+                value={ingestTo}
+                onChange={(e) => setIngestTo(e.target.value)}
+                disabled={cronLoading}
+                min={ingestFrom}
+                className="px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 disabled:opacity-50"
+              />
+            </div>
+
+            {/* Run ingestion */}
+            <button
+              onClick={handleRunIngestion}
+              disabled={cronLoading || clearLoading}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {cronLoading ? (
+                <>
+                  <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Ingesting…
+                </>
+              ) : (
+                <>
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Run Ingestion
+                </>
+              )}
+            </button>
+
+            {/* Clear records */}
+            <button
+              onClick={handleClearRecords}
+              disabled={cronLoading || clearLoading}
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg border border-red-700 text-red-400 hover:bg-red-900/40 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {clearLoading ? (
+                <>
+                  <span className="w-3.5 h-3.5 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />
+                  Clearing…
+                </>
+              ) : (
+                <>
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Clear Records
+                </>
+              )}
+            </button>
+          </div>
         </div>
 
         {/* Status banner */}
         {cronMessage && (
-          <div className={`px-6 py-2 text-xs font-medium border-t ${
-            cronMessage.startsWith("✓")
+          <div className={`px-6 py-2 text-xs font-medium border-t flex items-center justify-between ${
+            cronMessage.ok
               ? "border-emerald-800 bg-emerald-950/60 text-emerald-400"
               : "border-red-800 bg-red-950/60 text-red-400"
           }`}>
-            {cronMessage}
-            <button onClick={() => setCronMessage(null)} className="ml-4 opacity-60 hover:opacity-100">×</button>
+            <span>{cronMessage.text}</span>
+            <button onClick={() => setCronMessage(null)} className="ml-4 opacity-60 hover:opacity-100 text-base leading-none">×</button>
           </div>
         )}
 
-        {error && (
-          <div className="px-6 py-2 text-xs font-medium border-t border-red-800 bg-red-950/60 text-red-400">
-            API Error: {error}
-            <button onClick={() => setError(null)} className="ml-4 opacity-60 hover:opacity-100">×</button>
+        {apiError && (
+          <div className="px-6 py-2 text-xs font-medium border-t border-red-800 bg-red-950/60 text-red-400 flex items-center justify-between">
+            <span>API Error: {apiError}</span>
+            <button onClick={() => setApiError(null)} className="ml-4 opacity-60 hover:opacity-100 text-base leading-none">×</button>
           </div>
         )}
       </header>
 
-      {/* ---- Main ---- */}
+      {/* ---- Main ------------------------------------------- */}
       <main className="max-w-screen-xl mx-auto px-6 py-8 space-y-6">
+
         {/* Stats */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <StatCard
@@ -249,13 +368,13 @@ export default function Dashboard() {
           />
         </div>
 
-        {/* Controls */}
+        {/* Filter + export bar */}
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5 flex flex-wrap gap-4 items-end justify-between">
           <FilterBar filters={filters} onChange={setFilters} loading={loading} />
           <ExportButtons filters={filters} totalLeads={totalLeads} />
         </div>
 
-        {/* Table */}
+        {/* Leads table */}
         <LeadsTable
           probate={data.probate}
           foreclosure={data.foreclosure}
