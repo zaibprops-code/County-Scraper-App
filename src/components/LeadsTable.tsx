@@ -32,7 +32,7 @@ export default function LeadsTable({
   const rows = isForeclosure ? foreclosure : probate;
   const total = isForeclosure ? foreclosureTotal : probateTotal;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const from = (page - 1) * pageSize + 1;
+  const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const to = Math.min(page * pageSize, total);
 
   return (
@@ -85,9 +85,15 @@ export default function LeadsTable({
                     <TH>Deceased</TH>
                     <TH>Petitioner</TH>
                     <TH>Attorney</TH>
-                    <TH>Address</TH>
+                    <TH>Mailing Address</TH>
                     <TH>City</TH>
                     <TH>ZIP</TH>
+                    <TH title="Matched from Hillsborough Property Appraiser">
+                      Matched Property
+                    </TH>
+                    <TH>Prop. City</TH>
+                    <TH>Prop. ZIP</TH>
+                    <TH>Match</TH>
                   </>
                 )}
               </tr>
@@ -95,42 +101,42 @@ export default function LeadsTable({
             <tbody className="divide-y divide-slate-800/60">
               {isForeclosure
                 ? (rows as ForeclosureLead[]).map((row, i) => (
-                    <tr
-                      key={row.id ?? i}
-                      className="hover:bg-slate-800/40 transition-colors group"
-                    >
+                    <tr key={row.id ?? i} className="hover:bg-slate-800/40 transition-colors">
                       <TD mono>{row.case_number}</TD>
                       <TD>{row.filing_date ?? "—"}</TD>
-                      <TD>
-                        <Badge type="orange">{row.case_type ?? "—"}</Badge>
-                      </TD>
+                      <TD><Badge type="orange">{row.case_type ?? "—"}</Badge></TD>
                       <TD>{row.defendant ?? "—"}</TD>
                       <TD muted>{row.plaintiff ?? "—"}</TD>
                       <TD muted>{row.attorney ?? "—"}</TD>
                       <TD muted>{row.address ?? "—"}</TD>
                       <TD muted>{row.city ?? "—"}</TD>
-                      <TD mono muted>
-                        {row.zip ?? "—"}
-                      </TD>
+                      <TD mono muted>{row.zip ?? "—"}</TD>
                     </tr>
                   ))
                 : (rows as ProbateLead[]).map((row, i) => (
-                    <tr
-                      key={row.id ?? i}
-                      className="hover:bg-slate-800/40 transition-colors group"
-                    >
+                    <tr key={row.id ?? i} className="hover:bg-slate-800/40 transition-colors">
                       <TD mono>{row.case_number}</TD>
                       <TD>{row.filing_date ?? "—"}</TD>
-                      <TD>
-                        <Badge type="purple">{row.case_type ?? "—"}</Badge>
-                      </TD>
+                      <TD><Badge type="purple">{row.case_type ?? "—"}</Badge></TD>
                       <TD>{row.deceased_name ?? "—"}</TD>
                       <TD muted>{row.petitioner ?? "—"}</TD>
                       <TD muted>{row.attorney ?? "—"}</TD>
                       <TD muted>{row.address ?? "—"}</TD>
                       <TD muted>{row.city ?? "—"}</TD>
-                      <TD mono muted>
-                        {row.zip ?? "—"}
+                      <TD mono muted>{row.zip ?? "—"}</TD>
+
+                      {/* Matched property columns */}
+                      <TD>
+                        {row.matched_property_address ? (
+                          <span className="text-emerald-400">{row.matched_property_address}</span>
+                        ) : (
+                          <span className="text-slate-600">—</span>
+                        )}
+                      </TD>
+                      <TD muted>{row.matched_property_city ?? "—"}</TD>
+                      <TD mono muted>{row.matched_property_zip ?? "—"}</TD>
+                      <TD>
+                        <MatchStatusBadge status={row.property_match_status ?? null} />
                       </TD>
                     </tr>
                   ))}
@@ -144,25 +150,12 @@ export default function LeadsTable({
         <div className="px-6 py-4 border-t border-slate-800 flex items-center justify-between">
           <span className="text-xs text-slate-500">
             Showing {from}–{to} of{" "}
-            <span className="text-slate-300 font-semibold">
-              {total.toLocaleString()}
-            </span>{" "}
-            leads
+            <span className="text-slate-300 font-semibold">{total.toLocaleString()}</span> leads
           </span>
           <div className="flex items-center gap-2">
-            <PaginationButton
-              onClick={() => onPageChange(page - 1)}
-              disabled={page <= 1}
-              label="← Prev"
-            />
-            <span className="text-xs text-slate-500 px-2">
-              {page} / {totalPages}
-            </span>
-            <PaginationButton
-              onClick={() => onPageChange(page + 1)}
-              disabled={page >= totalPages}
-              label="Next →"
-            />
+            <PaginationButton onClick={() => onPageChange(page - 1)} disabled={page <= 1} label="← Prev" />
+            <span className="text-xs text-slate-500 px-2">{page} / {totalPages}</span>
+            <PaginationButton onClick={() => onPageChange(page + 1)} disabled={page >= totalPages} label="Next →" />
           </div>
         </div>
       )}
@@ -170,14 +163,10 @@ export default function LeadsTable({
   );
 }
 
-// ---- Sub-components -----------------------------------------------
+// ---- Sub-components ------------------------------------------
 
 function TabButton({
-  active,
-  onClick,
-  label,
-  count,
-  color,
+  active, onClick, label, count, color,
 }: {
   active: boolean;
   onClick: () => void;
@@ -198,78 +187,69 @@ function TabButton({
       }`}
     >
       {label}
-      <span
-        className={`ml-2.5 px-2 py-0.5 rounded-full text-xs font-bold ${
-          active
-            ? color === "purple"
-              ? "bg-purple-500/20 text-purple-300"
-              : "bg-orange-500/20 text-orange-300"
-            : "bg-slate-800 text-slate-500"
-        }`}
-      >
+      <span className={`ml-2.5 px-2 py-0.5 rounded-full text-xs font-bold ${
+        active
+          ? color === "purple" ? "bg-purple-500/20 text-purple-300" : "bg-orange-500/20 text-orange-300"
+          : "bg-slate-800 text-slate-500"
+      }`}>
         {count.toLocaleString()}
       </span>
     </button>
   );
 }
 
-function TH({ children }: { children: React.ReactNode }) {
+function TH({ children, title }: { children: React.ReactNode; title?: string }) {
   return (
-    <th className="px-4 py-3 text-left text-xs font-bold text-slate-500 uppercase tracking-widest whitespace-nowrap">
+    <th
+      title={title}
+      className="px-4 py-3 text-left text-xs font-bold text-slate-500 uppercase tracking-widest whitespace-nowrap"
+    >
       {children}
     </th>
   );
 }
 
-function TD({
-  children,
-  mono,
-  muted,
-}: {
-  children: React.ReactNode;
-  mono?: boolean;
-  muted?: boolean;
-}) {
+function TD({ children, mono, muted }: { children: React.ReactNode; mono?: boolean; muted?: boolean }) {
   return (
-    <td
-      className={`px-4 py-3 whitespace-nowrap ${
-        mono ? "font-mono text-xs" : "text-sm"
-      } ${muted ? "text-slate-400" : "text-slate-200"}`}
-    >
+    <td className={`px-4 py-3 whitespace-nowrap ${mono ? "font-mono text-xs" : "text-sm"} ${muted ? "text-slate-400" : "text-slate-200"}`}>
       {children}
     </td>
   );
 }
 
-function Badge({
-  children,
-  type,
-}: {
-  children: React.ReactNode;
-  type: "purple" | "orange";
-}) {
+function Badge({ children, type }: { children: React.ReactNode; type: "purple" | "orange" }) {
   return (
-    <span
-      className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${
-        type === "purple"
-          ? "bg-purple-500/15 text-purple-300"
-          : "bg-orange-500/15 text-orange-300"
-      }`}
-    >
+    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${
+      type === "purple" ? "bg-purple-500/15 text-purple-300" : "bg-orange-500/15 text-orange-300"
+    }`}>
       {children}
     </span>
   );
 }
 
-function PaginationButton({
-  onClick,
-  disabled,
-  label,
-}: {
-  onClick: () => void;
-  disabled: boolean;
-  label: string;
-}) {
+function MatchStatusBadge({ status }: { status: string | null }) {
+  if (!status) return <span className="text-slate-700 text-xs">—</span>;
+
+  const styles: Record<string, string> = {
+    matched: "bg-emerald-500/15 text-emerald-400",
+    no_match: "bg-slate-700 text-slate-500",
+    error: "bg-red-500/15 text-red-400",
+  };
+
+  const labels: Record<string, string> = {
+    matched: "✓ Match",
+    no_match: "No Match",
+    error: "Error",
+  };
+
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${styles[status] ?? "bg-slate-700 text-slate-500"}`}>
+      {labels[status] ?? status}
+    </span>
+  );
+}
+
+function PaginationButton({ onClick, disabled, label }: { onClick: () => void; disabled: boolean; label: string }) {
   return (
     <button
       onClick={onClick}
@@ -296,7 +276,7 @@ function EmptyState() {
       <div className="text-4xl mb-3">📭</div>
       <p className="text-slate-400 text-sm font-medium">No leads found</p>
       <p className="text-slate-600 text-xs mt-1">
-        Try adjusting your filters or run the cron to ingest new data.
+        Select a date range and click Run Ingestion.
       </p>
     </div>
   );
