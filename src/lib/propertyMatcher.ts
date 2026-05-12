@@ -1,9 +1,9 @@
 // ============================================================
 // Property Matcher — Hillsborough County Property Appraiser
-// DEBUG BUILD: Maximum verbosity on every step.
+// DEBUG BUILD: Full request/response logging + retry logic.
 // ============================================================
 
-import axios from "axios";
+import axios, { AxiosError } from "axios";
 import type { HcpaProperty } from "@/types/leads";
 
 const HCPA_OWNER_SEARCH =
@@ -12,21 +12,25 @@ const HCPA_OWNER_SEARCH =
 const ARCGIS_QUERY =
   "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/0/query";
 
-const REQUEST_HEADERS = {
+// Browser-like headers to avoid bot detection
+const BROWSER_HEADERS = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-  Accept: "application/json, text/plain, */*",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept:
+    "application/json, text/javascript, */*; q=0.01",
   "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
   Referer: "https://gis.hcpafl.org/propertysearch/",
+  Origin: "https://gis.hcpafl.org",
+  "X-Requested-With": "XMLHttpRequest",
+  Connection: "keep-alive",
 };
 
-const DELAY_MS = 350;
+export const DELAY_MS = 400;
 const TIMEOUT_MS = 12000;
-
-// Minimum score to accept a match — set very low for debug visibility
+const RETRY_COUNT = 3;
+const RETRY_DELAY_MS = 1000;
 const MIN_ACCEPT_SCORE = 1;
-
-export { DELAY_MS };
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -73,453 +77,368 @@ export function buildOwnerSearchString(parsed: ParsedName): string {
   return parsed.first ? `${parsed.last}, ${parsed.first}` : parsed.last;
 }
 
-// ---- Response parsing (handles axios auto-parsed JSON) ------
+// ---- HTTP request with retry --------------------------------
 
-function extractItems(rawData: unknown, leadId: number): Record<string, unknown>[] {
-  console.log(`[PM:L${leadId}] extractItems — typeof rawData: ${typeof rawData}`);
-  console.log(`[PM:L${leadId}] extractItems — isArray: ${Array.isArray(rawData)}`);
+interface FetchResult {
+  status: number;
+  data: unknown;
+  headers: Record<string, string>;
+  ok: boolean;
+}
 
-  // axios auto-parses JSON — rawData is already an object/array (not a string)
+async function fetchWithRetry(
+  url: string,
+  params: Record<string, string | number | boolean>,
+  leadId: number,
+  label: string
+): Promise<FetchResult | null> {
+  for (let attempt = 1; attempt <= RETRY_COUNT; attempt++) {
+    const fullUrl =
+      url + "?" + Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join("&");
+
+    console.log(`[PM:L${leadId}] ${label} attempt ${attempt}/${RETRY_COUNT}`);
+    console.log(`[PM:L${leadId}] ${label} full URL: ${fullUrl}`);
+
+    try {
+      const resp = await axios.get(url, {
+        params,
+        timeout: TIMEOUT_MS,
+        headers: BROWSER_HEADERS,
+        validateStatus: () => true, // never throw on any status
+        maxRedirects: 5,
+      });
+
+      // Log response metadata
+      const respHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(resp.headers ?? {})) {
+        respHeaders[k] = String(v);
+      }
+
+      console.log(`[PM:L${leadId}] ${label} HTTP status: ${resp.status}`);
+      console.log(`[PM:L${leadId}] ${label} Content-Type: ${respHeaders["content-type"] ?? "unknown"}`);
+      console.log(`[PM:L${leadId}] ${label} Content-Length: ${respHeaders["content-length"] ?? "unknown"}`);
+
+      const rawBody =
+        typeof resp.data === "string"
+          ? (resp.data as string)
+          : JSON.stringify(resp.data ?? "");
+      console.log(`[PM:L${leadId}] ${label} body (first 600): ${rawBody.slice(0, 600)}`);
+
+      if (resp.status >= 200 && resp.status < 300) {
+        console.log(`[PM:L${leadId}] ${label} attempt ${attempt} SUCCESS`);
+        return { status: resp.status, data: resp.data, headers: respHeaders, ok: true };
+      }
+
+      console.warn(`[PM:L${leadId}] ${label} non-2xx: ${resp.status} — ${rawBody.slice(0, 200)}`);
+
+      if (resp.status === 400 || resp.status === 404) {
+        console.log(`[PM:L${leadId}] ${label} permanent failure (${resp.status}) — not retrying`);
+        return { status: resp.status, data: resp.data, headers: respHeaders, ok: false };
+      }
+
+      if (attempt < RETRY_COUNT) {
+        console.log(`[PM:L${leadId}] ${label} waiting ${RETRY_DELAY_MS}ms before retry...`);
+        await sleep(RETRY_DELAY_MS);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const axErr = err as AxiosError;
+      console.error(`[PM:L${leadId}] ${label} attempt ${attempt} EXCEPTION: ${msg}`);
+      if (axErr.code) console.error(`[PM:L${leadId}] ${label} axios error code: ${axErr.code}`);
+      if (axErr.response) {
+        console.error(`[PM:L${leadId}] ${label} error response status: ${axErr.response.status}`);
+        console.error(`[PM:L${leadId}] ${label} error response data: ${JSON.stringify(axErr.response.data).slice(0, 300)}`);
+      }
+
+      if (attempt < RETRY_COUNT) {
+        console.log(`[PM:L${leadId}] ${label} waiting ${RETRY_DELAY_MS}ms before retry...`);
+        await sleep(RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  console.error(`[PM:L${leadId}] ${label} ALL ${RETRY_COUNT} attempts failed`);
+  return null;
+}
+
+// ---- Response item extraction --------------------------------
+
+function extractItems(rawData: unknown, leadId: number, label: string): Record<string, unknown>[] {
+  // axios auto-parses JSON — check array/object first
   if (Array.isArray(rawData)) {
-    console.log(`[PM:L${leadId}] extractItems — direct array, length=${rawData.length}`);
+    console.log(`[PM:L${leadId}] ${label} extractItems: direct array, length=${rawData.length}`);
     return rawData as Record<string, unknown>[];
   }
 
   if (rawData !== null && typeof rawData === "object") {
     const obj = rawData as Record<string, unknown>;
-    console.log(`[PM:L${leadId}] extractItems — object keys: ${Object.keys(obj).join(", ")}`);
-    // WCF JSON: { d: [...] }
-    const inner = obj["d"] ?? obj["results"] ?? obj["value"] ?? obj["data"];
+    console.log(`[PM:L${leadId}] ${label} extractItems: object keys=${Object.keys(obj).join(", ")}`);
+    // WCF JSON wrapper: { d: [...] }
+    const inner = obj["d"] ?? obj["results"] ?? obj["value"] ?? obj["data"] ?? obj["items"];
     if (Array.isArray(inner)) {
-      console.log(`[PM:L${leadId}] extractItems — found inner array via wrapper key, length=${(inner as unknown[]).length}`);
+      console.log(`[PM:L${leadId}] ${label} extractItems: found inner array, length=${(inner as unknown[]).length}`);
       return inner as Record<string, unknown>[];
     }
-    console.log(`[PM:L${leadId}] extractItems — no array wrapper found, checking all values`);
-    // Last resort: look for any array value in the object
+    // Last resort: find any array value
     for (const [k, v] of Object.entries(obj)) {
       if (Array.isArray(v) && (v as unknown[]).length > 0) {
-        console.log(`[PM:L${leadId}] extractItems — found array at key "${k}", length=${(v as unknown[]).length}`);
+        console.log(`[PM:L${leadId}] ${label} extractItems: found array at key "${k}", length=${(v as unknown[]).length}`);
         return v as Record<string, unknown>[];
       }
     }
+    console.log(`[PM:L${leadId}] ${label} extractItems: no array found in object`);
+    return [];
   }
 
-  // String fallback (should not normally happen with axios JSON auto-parse)
+  // String fallback
   if (typeof rawData === "string") {
     const s = (rawData as string).trim();
-    console.log(`[PM:L${leadId}] extractItems — string response, first 200 chars: ${s.slice(0, 200)}`);
     if (s.startsWith("[")) {
-      try {
-        const parsed = JSON.parse(s);
-        console.log(`[PM:L${leadId}] extractItems — parsed string array, length=${parsed.length}`);
-        return parsed;
-      } catch (e) {
-        console.log(`[PM:L${leadId}] extractItems — JSON.parse failed: ${e}`);
-      }
+      try { const p = JSON.parse(s); console.log(`[PM:L${leadId}] ${label} extractItems: parsed string array, length=${p.length}`); return p; }
+      catch (e) { console.log(`[PM:L${leadId}] ${label} extractItems: JSON.parse array failed: ${e}`); }
     }
     if (s.startsWith("{")) {
       try {
         const obj = JSON.parse(s) as Record<string, unknown>;
         const inner = obj["d"] ?? obj["results"] ?? obj["value"];
         if (Array.isArray(inner)) return inner as Record<string, unknown>[];
-      } catch (e) {
-        console.log(`[PM:L${leadId}] extractItems — object parse failed: ${e}`);
-      }
+      } catch (e) { console.log(`[PM:L${leadId}] ${label} extractItems: JSON.parse object failed: ${e}`); }
     }
-    if (s.toLowerCase().startsWith("<html") || s.toLowerCase().startsWith("<!")) {
-      console.log(`[PM:L${leadId}] extractItems — HTML response (auth wall / error page)`);
+    if (s.toLowerCase().startsWith("<html") || s.startsWith("<!")) {
+      console.log(`[PM:L${leadId}] ${label} extractItems: HTML response — likely auth wall / server error`);
     }
   }
 
-  console.log(`[PM:L${leadId}] extractItems — could not extract items, returning []`);
+  console.log(`[PM:L${leadId}] ${label} extractItems: returning []`);
   return [];
 }
 
-function mapItemToProperty(item: Record<string, unknown>): HcpaProperty {
+function mapItem(item: Record<string, unknown>): HcpaProperty {
   return {
-    ownerName: String(
-      item["Name"] ?? item["OwnerName"] ?? item["OWN1"] ?? item["name"] ?? item["OWNER"] ?? ""
-    ).trim(),
-    siteAddress: String(
-      item["Address"] ?? item["SiteAddress"] ?? item["SITE_ADDR"] ??
-      item["address"] ?? item["PHYADDR"] ?? item["SiteAddr"] ?? ""
-    ).trim(),
-    siteCity: String(
-      item["City"] ?? item["SiteCity"] ?? item["CITY"] ?? item["city"] ?? item["PHYCITY"] ?? ""
-    ).trim(),
-    siteState: String(
-      item["State"] ?? item["SiteState"] ?? item["STATE"] ?? item["state"] ?? "FL"
-    ).trim(),
-    siteZip: String(
-      item["ZipCode"] ?? item["SiteZip"] ?? item["ZIP"] ?? item["zip"] ??
-      item["PHYZIP"] ?? item["Zip"] ?? ""
-    ).trim(),
+    ownerName: String(item["Name"] ?? item["OwnerName"] ?? item["OWN1"] ?? item["name"] ?? item["OWNER"] ?? "").trim(),
+    siteAddress: String(item["Address"] ?? item["SiteAddress"] ?? item["SITE_ADDR"] ?? item["address"] ?? item["SiteAddr"] ?? "").trim(),
+    siteCity: String(item["City"] ?? item["SiteCity"] ?? item["CITY"] ?? item["city"] ?? item["PHYCITY"] ?? "").trim(),
+    siteState: String(item["State"] ?? item["SiteState"] ?? item["STATE"] ?? item["state"] ?? "FL").trim(),
+    siteZip: String(item["ZipCode"] ?? item["SiteZip"] ?? item["ZIP"] ?? item["zip"] ?? item["PHYZIP"] ?? item["Zip"] ?? "").trim(),
   };
+}
+
+// ---- HPAServices (primary) ----------------------------------
+
+async function searchHpaServices(searchStr: string, leadId: number): Promise<HcpaProperty[]> {
+  console.log(`[PM:L${leadId}] HPAServices search: "${searchStr}"`);
+
+  const result = await fetchWithRetry(
+    HCPA_OWNER_SEARCH,
+    { ownerName: searchStr },
+    leadId,
+    "HPAServices"
+  );
+
+  if (!result || !result.ok) {
+    console.log(`[PM:L${leadId}] HPAServices: no successful response`);
+    return [];
+  }
+
+  const items = extractItems(result.data, leadId, "HPAServices");
+  if (items.length > 0) {
+    console.log(`[PM:L${leadId}] HPAServices: item[0] keys: ${Object.keys(items[0]).join(", ")}`);
+  }
+
+  const props = items.map(mapItem).filter((p) => p.ownerName.length > 0);
+  console.log(`[PM:L${leadId}] HPAServices: ${props.length} usable properties`);
+  props.forEach((p, i) =>
+    console.log(`[PM:L${leadId}]   HPAServices[${i}] owner="${p.ownerName}" addr="${p.siteAddress}" city="${p.siteCity}"`)
+  );
+  return props;
+}
+
+// ---- ArcGIS fallback ----------------------------------------
+
+async function searchArcGIS(lastName: string, leadId: number): Promise<HcpaProperty[]> {
+  const safeLast = lastName.replace(/'/g, "''");
+  const where = `UPPER(OWN1) LIKE '%${safeLast}%'`;
+  console.log(`[PM:L${leadId}] ArcGIS search: where="${where}"`);
+
+  const result = await fetchWithRetry(
+    ARCGIS_QUERY,
+    {
+      where,
+      outFields: "OWN1,PHYADDR,PHYDIRPFX,PHYNAME,PHYSUF,PHYUNIT,PHYCITY,PHYZIP",
+      returnGeometry: "false",
+      resultRecordCount: 20,
+      f: "json",
+    },
+    leadId,
+    "ArcGIS"
+  );
+
+  if (!result || !result.ok) {
+    console.log(`[PM:L${leadId}] ArcGIS: no successful response`);
+    return [];
+  }
+
+  const data = result.data as { features?: Array<{ attributes: Record<string, unknown> }> };
+  const features = data?.features ?? [];
+  console.log(`[PM:L${leadId}] ArcGIS: ${features.length} feature(s)`);
+
+  const props = features.map((f) => {
+    const a = f.attributes ?? {};
+    const parts = [
+      String(a["PHYADDR"] ?? ""), String(a["PHYDIRPFX"] ?? ""),
+      String(a["PHYNAME"] ?? ""), String(a["PHYSUF"] ?? ""),
+      String(a["PHYUNIT"] ?? ""),
+    ].map((s) => s.trim()).filter(Boolean);
+    return {
+      ownerName: String(a["OWN1"] ?? "").trim(),
+      siteAddress: parts.join(" ").trim(),
+      siteCity: String(a["PHYCITY"] ?? "").trim(),
+      siteState: "FL",
+      siteZip: String(a["PHYZIP"] ?? "").trim(),
+    };
+  }).filter((p) => p.ownerName.length > 0);
+
+  props.forEach((p, i) =>
+    console.log(`[PM:L${leadId}]   ArcGIS[${i}] owner="${p.ownerName}" addr="${p.siteAddress}"`)
+  );
+  return props;
 }
 
 // ---- Scoring ------------------------------------------------
 
-interface ScoredProperty {
-  prop: HcpaProperty;
-  score: number;
-  reasons: string[];
-}
+interface ScoredProperty { prop: HcpaProperty; score: number; reasons: string[]; }
 
-function scoreProperty(
-  prop: HcpaProperty,
-  parsed: ParsedName,
-  idx: number,
-  leadId: number
-): ScoredProperty {
+function scoreProperty(prop: HcpaProperty, parsed: ParsedName, idx: number, leadId: number): ScoredProperty {
   const owner = prop.ownerName.toUpperCase().trim();
   const addr = prop.siteAddress.toUpperCase().trim();
   const { last, first, middle } = parsed;
   let score = 0;
   const reasons: string[] = [];
 
-  console.log(`[PM:L${leadId}]   Candidate[${idx}]: ownerName="${owner}" addr="${addr}" city="${prop.siteCity}" zip="${prop.siteZip}"`);
+  console.log(`[PM:L${leadId}]   Candidate[${idx}]: owner="${owner}" addr="${addr}" city="${prop.siteCity}" zip="${prop.siteZip}"`);
 
-  // ---- Last name (hard check) ----
-  const lastInOwner = owner.includes(last);
-  if (!lastInOwner) {
-    const reason = `HARD REJECT — "${last}" not found in "${owner}"`;
-    console.log(`[PM:L${leadId}]   [${idx}] ${reason}`);
-    return { prop, score: -999, reasons: [reason] };
+  if (!owner.includes(last)) {
+    const r = `HARD REJECT — "${last}" not in "${owner}"`;
+    console.log(`[PM:L${leadId}]   [${idx}] ${r}`);
+    return { prop, score: -999, reasons: [r] };
   }
-  score += 20;
-  reasons.push(`+20 last "${last}" in owner`);
-  console.log(`[PM:L${leadId}]   [${idx}] +20 last name "${last}" found in "${owner}"`);
+  score += 20; reasons.push(`+20 last "${last}"`);
+  console.log(`[PM:L${leadId}]   [${idx}] +20 last "${last}" found`);
 
-  // Last name at start
   if (owner.startsWith(last + ",") || owner.startsWith(last + " ") || owner === last) {
-    score += 5;
-    reasons.push("+5 last at start");
-    console.log(`[PM:L${leadId}]   [${idx}] +5 last name at start`);
+    score += 5; reasons.push("+5 last at start");
+    console.log(`[PM:L${leadId}]   [${idx}] +5 last at start`);
   }
 
-  // ---- First name ----
   if (first) {
-    const firstInitial = first.charAt(0);
-    const exactFirst = owner.includes(first);
-    // Initial pattern: space+initial+space/end/comma/dot
-    const initialPattern = new RegExp(`(?:^|[\\s,])${firstInitial}(?:[\\s,.$]|$)`);
-    const initialMatch = initialPattern.test(owner);
-    const weakInitial = owner.includes(` ${firstInitial}`) || owner.includes(`,${firstInitial}`) || owner.includes(` ${firstInitial} `);
-
-    if (exactFirst) {
-      score += 10;
-      reasons.push(`+10 exact first "${first}"`);
+    const fi = first.charAt(0);
+    if (owner.includes(first)) {
+      score += 10; reasons.push(`+10 exact first "${first}"`);
       console.log(`[PM:L${leadId}]   [${idx}] +10 exact first "${first}"`);
-    } else if (initialMatch) {
-      score += 6;
-      reasons.push(`+6 first initial "${firstInitial}" (word boundary)`);
-      console.log(`[PM:L${leadId}]   [${idx}] +6 first initial "${firstInitial}" (word boundary match)`);
-    } else if (weakInitial) {
-      score += 3;
-      reasons.push(`+3 first initial "${firstInitial}" (weak)`);
-      console.log(`[PM:L${leadId}]   [${idx}] +3 first initial "${firstInitial}" (weak match in "${owner}")`);
+    } else if (new RegExp(`(?:^|[\\s,])${fi}(?:[\\s,.$]|$)`).test(owner)) {
+      score += 6; reasons.push(`+6 initial "${fi}" (word boundary)`);
+      console.log(`[PM:L${leadId}]   [${idx}] +6 first initial "${fi}" word boundary`);
+    } else if (owner.includes(` ${fi}`) || owner.includes(`,${fi}`)) {
+      score += 3; reasons.push(`+3 initial "${fi}" (weak)`);
+      console.log(`[PM:L${leadId}]   [${idx}] +3 first initial "${fi}" weak`);
     } else {
-      reasons.push(`+0 first name no match (first="${first}", initial="${firstInitial}", owner="${owner}")`);
-      console.log(`[PM:L${leadId}]   [${idx}] +0 first name "${first}" / initial "${firstInitial}" NOT found in "${owner}"`);
+      console.log(`[PM:L${leadId}]   [${idx}] +0 first "${first}" / initial "${fi}" NOT in "${owner}"`);
     }
-  } else {
-    console.log(`[PM:L${leadId}]   [${idx}] no first name to match`);
   }
 
-  // ---- Middle ----
   if (middle) {
-    const midInitial = middle.charAt(0);
-    const exactMid = owner.includes(middle);
-    const midInit = new RegExp(`(?:^|[\\s,])${midInitial}(?:[\\s,.$]|$)`).test(owner);
-    if (exactMid) {
-      score += 3;
-      reasons.push(`+3 middle "${middle}"`);
-      console.log(`[PM:L${leadId}]   [${idx}] +3 middle "${middle}" found`);
-    } else if (midInit) {
-      score += 1;
-      reasons.push(`+1 middle initial "${midInitial}"`);
-      console.log(`[PM:L${leadId}]   [${idx}] +1 middle initial "${midInitial}" found`);
-    } else {
-      console.log(`[PM:L${leadId}]   [${idx}] +0 middle "${middle}" NOT found in "${owner}"`);
-    }
+    const mi = middle.charAt(0);
+    if (owner.includes(middle)) { score += 3; reasons.push(`+3 middle "${middle}"`); console.log(`[PM:L${leadId}]   [${idx}] +3 middle "${middle}"`); }
+    else if (new RegExp(`(?:^|[\\s,])${mi}(?:[\\s,.$]|$)`).test(owner)) { score += 1; reasons.push(`+1 mid-init "${mi}"`); console.log(`[PM:L${leadId}]   [${idx}] +1 middle initial "${mi}"`); }
+    else { console.log(`[PM:L${leadId}]   [${idx}] +0 middle "${middle}" NOT in "${owner}"`); }
   }
 
-  // ---- Trust / estate detection ----
-  if (owner.includes("REVOCABLE TRUST") || owner.includes("REV TRUST")) {
-    score += 3;
-    reasons.push("+3 revocable trust");
-    console.log(`[PM:L${leadId}]   [${idx}] +3 REVOCABLE TRUST detected — valid for probate`);
-  } else if (owner.includes("TRUST")) {
-    score += 2;
-    reasons.push("+2 trust");
-    console.log(`[PM:L${leadId}]   [${idx}] +2 TRUST detected`);
-  }
-  if (owner.includes("ESTATE OF") || owner.includes("ESTATE")) {
-    score += 2;
-    reasons.push("+2 estate");
-    console.log(`[PM:L${leadId}]   [${idx}] +2 ESTATE detected`);
-  }
-  if (owner.includes("LIVING TRUST")) {
-    score += 1;
-    reasons.push("+1 living trust");
-    console.log(`[PM:L${leadId}]   [${idx}] +1 LIVING TRUST detected`);
-  }
+  if (owner.includes("REVOCABLE TRUST") || owner.includes("REV TRUST")) { score += 3; reasons.push("+3 rev trust"); console.log(`[PM:L${leadId}]   [${idx}] +3 REVOCABLE TRUST`); }
+  else if (owner.includes("TRUST")) { score += 2; reasons.push("+2 trust"); console.log(`[PM:L${leadId}]   [${idx}] +2 TRUST`); }
+  if (owner.includes("ESTATE")) { score += 2; reasons.push("+2 estate"); console.log(`[PM:L${leadId}]   [${idx}] +2 ESTATE`); }
 
-  // ---- Address quality ----
-  if (!addr) {
-    score -= 10;
-    reasons.push("-10 no address");
-    console.log(`[PM:L${leadId}]   [${idx}] -10 no site address`);
-  } else if (addr.includes("PO BOX") || addr.includes("P.O. BOX") || addr.includes("P O BOX")) {
-    score -= 3;
-    reasons.push("-3 PO box");
-    console.log(`[PM:L${leadId}]   [${idx}] -3 PO box address`);
-  } else {
-    score += 3;
-    reasons.push("+3 real address");
-    console.log(`[PM:L${leadId}]   [${idx}] +3 non-PO-box address "${addr}"`);
-  }
+  if (!addr) { score -= 10; reasons.push("-10 no addr"); console.log(`[PM:L${leadId}]   [${idx}] -10 no address`); }
+  else if (addr.includes("PO BOX") || addr.includes("P.O.")) { score -= 3; reasons.push("-3 PO box"); console.log(`[PM:L${leadId}]   [${idx}] -3 PO box`); }
+  else { score += 3; reasons.push("+3 addr"); console.log(`[PM:L${leadId}]   [${idx}] +3 real address`); }
 
-  if (prop.siteState === "FL" || prop.siteState === "Florida") {
-    score += 2;
-    reasons.push("+2 FL");
-    console.log(`[PM:L${leadId}]   [${idx}] +2 Florida state`);
-  }
+  if (prop.siteState === "FL") { score += 2; reasons.push("+2 FL"); }
+  if (prop.siteZip && /^\d{5}/.test(prop.siteZip)) { score += 1; reasons.push("+1 ZIP"); }
 
-  if (prop.siteZip && /^\d{5}/.test(prop.siteZip)) {
-    score += 1;
-    reasons.push("+1 valid ZIP");
-    console.log(`[PM:L${leadId}]   [${idx}] +1 valid ZIP "${prop.siteZip}"`);
-  }
-
-  console.log(`[PM:L${leadId}]   [${idx}] TOTAL SCORE: ${score} — ${reasons.join(" | ")}`);
+  console.log(`[PM:L${leadId}]   [${idx}] TOTAL=${score} — ${reasons.join(" | ")}`);
   return { prop, score, reasons };
-}
-
-// ---- HPAServices --------------------------------------------
-
-async function searchHpaServices(
-  searchStr: string,
-  leadId: number
-): Promise<HcpaProperty[]> {
-  const fullUrl = `${HCPA_OWNER_SEARCH}?ownerName=${encodeURIComponent(searchStr)}`;
-  console.log(`[PM:L${leadId}] HPAServices request URL: ${fullUrl}`);
-
-  try {
-    const resp = await axios.get(HCPA_OWNER_SEARCH, {
-      params: { ownerName: searchStr },
-      timeout: TIMEOUT_MS,
-      headers: REQUEST_HEADERS,
-      validateStatus: (s) => s < 500,
-    });
-
-    console.log(`[PM:L${leadId}] HPAServices HTTP status: ${resp.status}`);
-    console.log(`[PM:L${leadId}] HPAServices Content-Type: ${resp.headers?.["content-type"] ?? "unknown"}`);
-    console.log(`[PM:L${leadId}] HPAServices resp.data type: ${typeof resp.data}, isArray: ${Array.isArray(resp.data)}`);
-
-    // Log raw response (truncated)
-    const rawStr = typeof resp.data === "string"
-      ? resp.data
-      : JSON.stringify(resp.data);
-    console.log(`[PM:L${leadId}] HPAServices raw response (first 500): ${rawStr.slice(0, 500)}`);
-
-    if (resp.status !== 200) {
-      console.log(`[PM:L${leadId}] HPAServices non-200 status — skipping`);
-      return [];
-    }
-
-    const items = extractItems(resp.data, leadId);
-    console.log(`[PM:L${leadId}] HPAServices extracted ${items.length} item(s)`);
-
-    if (items.length > 0) {
-      // Log raw item keys so we know the exact field names
-      console.log(`[PM:L${leadId}] HPAServices item[0] keys: ${Object.keys(items[0]).join(", ")}`);
-      console.log(`[PM:L${leadId}] HPAServices item[0] raw: ${JSON.stringify(items[0])}`);
-    }
-
-    const props = items
-      .map(mapItemToProperty)
-      .filter((p) => p.ownerName.length > 0 || p.siteAddress.length > 0);
-
-    console.log(`[PM:L${leadId}] HPAServices mapped ${props.length} properties:`);
-    props.forEach((p, i) =>
-      console.log(`[PM:L${leadId}]   [${i}] owner="${p.ownerName}" addr="${p.siteAddress}" city="${p.siteCity}" zip="${p.siteZip}"`)
-    );
-
-    return props;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[PM:L${leadId}] HPAServices EXCEPTION: ${msg}`);
-    if (err instanceof Error && "response" in err) {
-      const axErr = err as { response?: { status: number; data: unknown } };
-      console.error(`[PM:L${leadId}] HPAServices error response status: ${axErr.response?.status}`);
-      console.error(`[PM:L${leadId}] HPAServices error response data: ${JSON.stringify(axErr.response?.data).slice(0, 300)}`);
-    }
-    return [];
-  }
-}
-
-// ---- ArcGIS fallback ----------------------------------------
-
-async function searchArcGIS(
-  lastName: string,
-  leadId: number
-): Promise<HcpaProperty[]> {
-  const safeLast = lastName.replace(/'/g, "''");
-  const where = `UPPER(OWN1) LIKE '%${safeLast}%'`;
-  const fullUrl = `${ARCGIS_QUERY}?where=${encodeURIComponent(where)}&outFields=OWN1,PHYADDR,PHYDIRPFX,PHYNAME,PHYSUF,PHYUNIT,PHYCITY,PHYZIP&returnGeometry=false&resultRecordCount=20&f=json`;
-
-  console.log(`[PM:L${leadId}] ArcGIS request URL: ${fullUrl}`);
-
-  try {
-    const resp = await axios.get(ARCGIS_QUERY, {
-      params: {
-        where,
-        outFields: "OWN1,PHYADDR,PHYDIRPFX,PHYNAME,PHYSUF,PHYUNIT,PHYCITY,PHYZIP",
-        returnGeometry: false,
-        resultRecordCount: 20,
-        f: "json",
-      },
-      timeout: TIMEOUT_MS,
-      headers: REQUEST_HEADERS,
-      validateStatus: (s) => s < 500,
-    });
-
-    console.log(`[PM:L${leadId}] ArcGIS HTTP status: ${resp.status}`);
-    console.log(`[PM:L${leadId}] ArcGIS raw (first 400): ${JSON.stringify(resp.data).slice(0, 400)}`);
-
-    if (resp.status !== 200) return [];
-
-    const data = resp.data as { features?: Array<{ attributes: Record<string, unknown> }> };
-    const features = data?.features ?? [];
-    console.log(`[PM:L${leadId}] ArcGIS features count: ${features.length}`);
-
-    const props = features.map((f) => {
-      const a = f.attributes ?? {};
-      const parts = [
-        String(a["PHYADDR"] ?? ""),
-        String(a["PHYDIRPFX"] ?? ""),
-        String(a["PHYNAME"] ?? ""),
-        String(a["PHYSUF"] ?? ""),
-        String(a["PHYUNIT"] ?? ""),
-      ].map((s) => s.trim()).filter(Boolean);
-
-      return {
-        ownerName: String(a["OWN1"] ?? "").trim(),
-        siteAddress: parts.join(" ").trim(),
-        siteCity: String(a["PHYCITY"] ?? "").trim(),
-        siteState: "FL",
-        siteZip: String(a["PHYZIP"] ?? "").trim(),
-      };
-    }).filter((p) => p.ownerName.length > 0);
-
-    console.log(`[PM:L${leadId}] ArcGIS mapped ${props.length} properties:`);
-    props.forEach((p, i) =>
-      console.log(`[PM:L${leadId}]   [${i}] owner="${p.ownerName}" addr="${p.siteAddress}"`)
-    );
-
-    return props;
-  } catch (err) {
-    console.error(`[PM:L${leadId}] ArcGIS EXCEPTION: ${err instanceof Error ? err.message : err}`);
-    return [];
-  }
 }
 
 // ---- Main export --------------------------------------------
 
-export interface MatchedProperty {
-  address: string;
-  city: string;
-  state: string;
-  zip: string;
-}
+export interface MatchedProperty { address: string; city: string; state: string; zip: string; }
 
 export async function findPropertyForDecedent(
   deceasedName: string | null | undefined,
   leadId: number
 ): Promise<MatchedProperty | null> {
-  console.log(`[PM:L${leadId}] ========== START leadId=${leadId} ==========`);
-  console.log(`[PM:L${leadId}] deceased_name raw: "${deceasedName}"`);
+  console.log(`[PM:L${leadId}] ===== START id=${leadId} name="${deceasedName}" =====`);
 
   const parsed = parseName(deceasedName);
-
-  if (!parsed) {
-    console.log(`[PM:L${leadId}] ABORT — parseName returned null`);
+  if (!parsed || !parsed.last || parsed.last.length < 2) {
+    console.log(`[PM:L${leadId}] ABORT — unusable name`);
     return null;
   }
 
   console.log(`[PM:L${leadId}] parsed: last="${parsed.last}" first="${parsed.first}" middle="${parsed.middle}"`);
 
-  if (!parsed.last || parsed.last.length < 2) {
-    console.log(`[PM:L${leadId}] ABORT — last name too short or empty`);
-    return null;
-  }
-
   const searchStr = buildOwnerSearchString(parsed);
   console.log(`[PM:L${leadId}] HCPA search string: "${searchStr}"`);
 
-  // --- Attempt 1: HPAServices with "LAST, FIRST" ---
+  // Attempt 1: HPAServices "LAST, FIRST"
   let results = await searchHpaServices(searchStr, leadId);
+  if (results.length > 0) console.log(`[PM:L${leadId}] HPAServices "LAST, FIRST" → ${results.length} result(s) ✓`);
 
-  // --- Attempt 2: HPAServices with last name only ---
+  // Attempt 2: HPAServices last name only
   if (results.length === 0 && parsed.first) {
     console.log(`[PM:L${leadId}] Attempt 2: HPAServices last-only "${parsed.last}"`);
     results = await searchHpaServices(parsed.last, leadId);
+    if (results.length > 0) console.log(`[PM:L${leadId}] HPAServices last-only → ${results.length} result(s) ✓`);
   }
 
-  // --- Attempt 3: ArcGIS fallback ---
+  // Attempt 3: ArcGIS
   if (results.length === 0) {
     console.log(`[PM:L${leadId}] Attempt 3: ArcGIS fallback last="${parsed.last}"`);
     results = await searchArcGIS(parsed.last, leadId);
+    if (results.length > 0) console.log(`[PM:L${leadId}] ArcGIS → ${results.length} result(s) ✓`);
   }
 
-  console.log(`[PM:L${leadId}] Total candidates after all attempts: ${results.length}`);
+  console.log(`[PM:L${leadId}] Total candidates: ${results.length}`);
 
   if (results.length === 0) {
-    console.log(`[PM:L${leadId}] RESULT: no_match — zero candidates from all sources`);
+    console.log(`[PM:L${leadId}] RESULT: no_match — zero candidates`);
     return null;
   }
 
-  // Score all candidates
+  // Score
   console.log(`[PM:L${leadId}] === Scoring ${results.length} candidate(s) ===`);
-  const scored: ScoredProperty[] = results.map((prop, idx) =>
-    scoreProperty(prop, parsed, idx, leadId)
-  );
-
-  // Sort by score descending
+  const scored = results.map((p, i) => scoreProperty(p, parsed, i, leadId));
   const sorted = [...scored].sort((a, b) => b.score - a.score);
 
-  // Log top 5
-  console.log(`[PM:L${leadId}] === Top 5 candidates by score ===`);
-  sorted.slice(0, 5).forEach((s, i) => {
-    console.log(`[PM:L${leadId}]   #${i + 1} score=${s.score} owner="${s.prop.ownerName}" addr="${s.prop.siteAddress}"`);
-  });
-
-  // Accept candidates with score >= MIN_ACCEPT_SCORE AND a real address
-  const valid = sorted.filter(
-    (s) => s.score >= MIN_ACCEPT_SCORE && s.prop.siteAddress.trim().length > 0
+  console.log(`[PM:L${leadId}] === Top 5 ===`);
+  sorted.slice(0, 5).forEach((s, i) =>
+    console.log(`[PM:L${leadId}]   #${i + 1} score=${s.score} owner="${s.prop.ownerName}" addr="${s.prop.siteAddress}"`)
   );
 
-  console.log(`[PM:L${leadId}] Candidates with score>=${MIN_ACCEPT_SCORE} and address: ${valid.length}`);
+  const valid = sorted.filter((s) => s.score >= MIN_ACCEPT_SCORE && s.prop.siteAddress.trim().length > 0);
+  console.log(`[PM:L${leadId}] Valid (score>=${MIN_ACCEPT_SCORE} + addr): ${valid.length}`);
 
   if (valid.length === 0) {
-    // Log ALL rejection reasons for debugging
-    console.log(`[PM:L${leadId}] ALL REJECTED — reasons per candidate:`);
-    sorted.forEach((s, i) => {
-      const addrOk = s.prop.siteAddress.trim().length > 0;
-      console.log(
-        `[PM:L${leadId}]   [${i}] score=${s.score} addrOk=${addrOk} owner="${s.prop.ownerName}" | ${s.reasons.join(" | ")}`
-      );
-    });
+    console.log(`[PM:L${leadId}] ALL REJECTED — full rejection list:`);
+    sorted.forEach((s, i) =>
+      console.log(`[PM:L${leadId}]   [${i}] score=${s.score} addrOk=${s.prop.siteAddress.trim().length > 0} owner="${s.prop.ownerName}" | ${s.reasons.join(" | ")}`)
+    );
     console.log(`[PM:L${leadId}] RESULT: no_match`);
     return null;
   }
 
   const best = valid[0];
-  console.log(
-    `[PM:L${leadId}] RESULT: MATCHED → owner="${best.prop.ownerName}" addr="${best.prop.siteAddress}" city="${best.prop.siteCity}" zip="${best.prop.siteZip}" score=${best.score}`
-  );
-  console.log(`[PM:L${leadId}] ========== END leadId=${leadId} ==========`);
+  console.log(`[PM:L${leadId}] RESULT: MATCHED owner="${best.prop.ownerName}" addr="${best.prop.siteAddress}" city="${best.prop.siteCity}" score=${best.score}`);
+  console.log(`[PM:L${leadId}] ===== END id=${leadId} =====`);
 
   return {
     address: best.prop.siteAddress,
