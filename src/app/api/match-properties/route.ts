@@ -1,25 +1,14 @@
 // ============================================================
 // /api/match-properties — Property matching for probate leads
 //
-// GET /api/match-properties
-//
-// Behavior:
-//   1. Fetch all probate leads from DB that have a deceased_name
-//      and have NOT already been matched (property_match_status IS NULL)
-//   2. For each lead: search HCPA by last name
-//   3. Update matched_property_address columns
-//   4. Return summary of matches
-//
-// Does NOT clear data. Does NOT re-ingest. Only updates.
+// Processes ALL probate rows that have a deceased_name,
+// regardless of current property_match_status.
+// Logs every row — fetched, eligible, skipped, processed.
 // ============================================================
 
 import { NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabase";
-import {
-  findPropertyForDecedent,
-  sleep,
-  DELAY_MS,
-} from "@/lib/propertyMatcher";
+import { findPropertyForDecedent, sleep, DELAY_MS } from "@/lib/propertyMatcher";
 import type { PropertyMatchResult } from "@/types/leads";
 
 export const dynamic = "force-dynamic";
@@ -33,53 +22,97 @@ interface ProbateRow {
 }
 
 export async function GET(): Promise<NextResponse> {
-  console.log("[MatchProperties] ▶ Start property matching");
+  console.log("[MatchRoute] ===== START =====");
   const t0 = Date.now();
   const admin = getSupabaseAdmin();
 
   try {
-    // Fetch all probate leads that haven't been matched yet
-    const { data: leads, error: fetchErr } = await admin
+    // ---- Step 1: Fetch ALL probate rows (no filter on match status) ----
+    console.log("[MatchRoute] Fetching ALL probate_leads rows...");
+
+    const { data: allRows, error: fetchErr, count } = await admin
       .from("probate_leads")
-      .select("id,case_number,deceased_name,property_match_status")
-      .is("property_match_status", null)
-      .not("deceased_name", "is", null)
+      .select("id,case_number,deceased_name,property_match_status", { count: "exact" })
       .order("id", { ascending: true });
 
     if (fetchErr) {
-      console.error("[MatchProperties] Fetch error:", fetchErr);
+      console.error("[MatchRoute] Fetch error:", JSON.stringify(fetchErr));
       throw new Error(fetchErr.message);
     }
 
-    const rows = (leads ?? []) as ProbateRow[];
-    console.log(`[MatchProperties] ${rows.length} unmatched probate lead(s) to process`);
+    const rows = (allRows ?? []) as ProbateRow[];
+    console.log(`[MatchRoute] DB total probate rows (count from query): ${count ?? "unknown"}`);
+    console.log(`[MatchRoute] Rows returned in data array: ${rows.length}`);
 
-    if (rows.length === 0) {
+    // ---- Step 2: Log every row and classify ----
+    const eligible: ProbateRow[] = [];
+    const skippedNoName: ProbateRow[] = [];
+    const skippedAlreadyMatched: ProbateRow[] = [];
+
+    for (const row of rows) {
+      const hasName = row.deceased_name && row.deceased_name.trim().length > 0;
+      const alreadyMatched = row.property_match_status === "matched";
+
+      console.log(
+        `[MatchRoute] Row id=${row.id} case=${row.case_number} deceased="${row.deceased_name}" status="${row.property_match_status}" hasName=${hasName} alreadyMatched=${alreadyMatched}`
+      );
+
+      if (!hasName) {
+        skippedNoName.push(row);
+        console.log(`[MatchRoute]   → SKIP: no deceased_name`);
+        continue;
+      }
+
+      if (alreadyMatched) {
+        skippedAlreadyMatched.push(row);
+        console.log(`[MatchRoute]   → SKIP: already matched`);
+        continue;
+      }
+
+      eligible.push(row);
+      console.log(`[MatchRoute]   → ELIGIBLE for matching`);
+    }
+
+    console.log(`[MatchRoute] Summary:`);
+    console.log(`[MatchRoute]   Total rows fetched:        ${rows.length}`);
+    console.log(`[MatchRoute]   Skipped (no name):         ${skippedNoName.length}`);
+    console.log(`[MatchRoute]   Skipped (already matched): ${skippedAlreadyMatched.length}`);
+    console.log(`[MatchRoute]   Eligible to process:       ${eligible.length}`);
+
+    if (eligible.length === 0) {
+      const msg =
+        rows.length === 0
+          ? "No probate leads in DB. Run ingestion first."
+          : skippedAlreadyMatched.length === rows.length - skippedNoName.length
+          ? "All eligible leads already matched."
+          : "No eligible leads found (all have no deceased_name or are already matched).";
+
+      console.log(`[MatchRoute] Nothing to process: ${msg}`);
       return NextResponse.json({
         success: true,
         totalProcessed: 0,
         matched: 0,
         noMatch: 0,
         errors: 0,
-        message: "No unmatched probate leads found. Run ingestion first, or all leads already matched.",
+        message: msg,
       } satisfies PropertyMatchResult);
     }
 
+    // ---- Step 3: Process eligible rows ----
     let matched = 0;
     let noMatch = 0;
     let errors = 0;
 
-    for (let i = 0; i < rows.length; i++) {
-      const lead = rows[i];
+    for (let i = 0; i < eligible.length; i++) {
+      const lead = eligible[i];
       console.log(
-        `[MatchProperties] Processing ${i + 1}/${rows.length}: lead id=${lead.id} case=${lead.case_number} deceased="${lead.deceased_name}"`
+        `[MatchRoute] Processing ${i + 1}/${eligible.length}: id=${lead.id} case=${lead.case_number} deceased="${lead.deceased_name}"`
       );
 
       try {
         const property = await findPropertyForDecedent(lead.deceased_name, lead.id);
 
         if (property) {
-          // Update with matched property address
           const { error: updateErr } = await admin
             .from("probate_leads")
             .update({
@@ -92,37 +125,38 @@ export async function GET(): Promise<NextResponse> {
             .eq("id", lead.id);
 
           if (updateErr) {
-            console.error(`[MatchProperties] Update error for lead ${lead.id}:`, updateErr);
+            console.error(`[MatchRoute] Update error lead ${lead.id}:`, JSON.stringify(updateErr));
             errors++;
           } else {
-            console.log(`[MatchProperties] ✓ Matched lead ${lead.id}: ${property.address}, ${property.city}`);
+            console.log(`[MatchRoute] ✓ MATCHED lead ${lead.id}: "${property.address}, ${property.city}"`);
             matched++;
           }
         } else {
-          // Mark as no_match so we don't retry it endlessly
-          await admin
+          const { error: noMatchErr } = await admin
             .from("probate_leads")
             .update({ property_match_status: "no_match" })
             .eq("id", lead.id);
 
-          console.log(`[MatchProperties] ✗ No match for lead ${lead.id}`);
+          if (noMatchErr) {
+            console.error(`[MatchRoute] no_match update error lead ${lead.id}:`, JSON.stringify(noMatchErr));
+          }
+          console.log(`[MatchRoute] ✗ no_match lead ${lead.id}`);
           noMatch++;
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[MatchProperties] Error processing lead ${lead.id}: ${msg}`);
+        console.error(`[MatchRoute] EXCEPTION lead ${lead.id}: ${msg}`);
 
-        // Mark as error so we can retry later if needed
         await admin
           .from("probate_leads")
           .update({ property_match_status: "error" })
-          .eq("id", lead.id);
+          .eq("id", lead.id)
+          .then(({ error: e }) => { if (e) console.error(`[MatchRoute] error-status update failed:`, e); });
 
         errors++;
       }
 
-      // Rate limit: pause between requests to avoid hammering HCPA server
-      if (i < rows.length - 1) {
+      if (i < eligible.length - 1) {
         await sleep(DELAY_MS);
       }
     }
@@ -130,18 +164,19 @@ export async function GET(): Promise<NextResponse> {
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     const result: PropertyMatchResult = {
       success: true,
-      totalProcessed: rows.length,
+      totalProcessed: eligible.length,
       matched,
       noMatch,
       errors,
-      message: `Completed in ${elapsed}s`,
+      message: `Completed in ${elapsed}s. Fetched=${rows.length} Eligible=${eligible.length} SkippedNoName=${skippedNoName.length} SkippedAlreadyMatched=${skippedAlreadyMatched.length}`,
     };
 
-    console.log("[MatchProperties] ✓ Done:", result);
+    console.log("[MatchRoute] ✓ Done:", result);
+    console.log("[MatchRoute] ===== END =====");
     return NextResponse.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("[MatchProperties] ✗ Fatal:", message);
+    console.error("[MatchRoute] ✗ FATAL:", message);
     return NextResponse.json(
       {
         success: false,
