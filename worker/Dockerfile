@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Playwright to use system Chromium (avoids downloading another copy)
+# Tell Playwright to use system Chromium
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV CHROMIUM_PATH=/usr/bin/chromium
@@ -42,20 +42,24 @@ WORKDIR /app
 # Copy package files
 COPY package.json package-lock.json* ./
 
-# Install Node dependencies
-RUN npm ci --omit=dev
+# Install dependencies
+# (use npm install instead of npm ci because lockfile may not exist)
+RUN npm install --omit=dev
 
 # Copy TypeScript source and config
 COPY tsconfig.json ./
 COPY src/ ./src/
 
-# Install dev deps temporarily for build
+# Install temporary build dependencies
 RUN npm install --save-dev typescript @types/node @types/express ts-node
+
+# Build TypeScript
 RUN npm run build
-# Remove dev deps after build
+
+# Remove dev dependencies after build
 RUN npm prune --omit=dev
 
-# Railway injects PORT environment variable
+# Railway injects PORT automatically
 EXPOSE 3001
 
 CMD ["node", "dist/index.js"]
