@@ -1,9 +1,11 @@
 // ============================================================
 // Supabase client for the Railway worker.
 // Uses service role key — always bypasses RLS.
+// Fixed for Node.js 20 websocket support.
 // ============================================================
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import ws from "ws";
 
 let _client: SupabaseClient | null = null;
 
@@ -17,7 +19,13 @@ export function getSupabase(): SupabaseClient {
   if (!key) throw new Error("Missing env: SUPABASE_SERVICE_ROLE_KEY");
 
   _client = createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+    realtime: {
+      transport: ws,
+    },
   });
 
   return _client;
@@ -52,8 +60,12 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
   }
 
   const rows = (data ?? []) as ProbateLead[];
+
   console.log(`[DB] Total probate rows (count): ${count ?? "unknown"}`);
-  console.log(`[DB] Eligible for matching (not-null name, not matched): ${rows.length}`);
+  console.log(
+    `[DB] Eligible for matching (not-null name, not matched): ${rows.length}`
+  );
+
   return rows;
 }
 
@@ -81,11 +93,16 @@ export async function updateMatchedProperty(
     .eq("id", id);
 
   if (error) {
-    console.error(`[DB] updateMatchedProperty error for id=${id}:`, JSON.stringify(error));
+    console.error(
+      `[DB] updateMatchedProperty error for id=${id}:`,
+      JSON.stringify(error)
+    );
     throw new Error(error.message);
   }
 
-  console.log(`[DB] Updated lead id=${id}: ${address}, ${city}, ${state} ${zip}`);
+  console.log(
+    `[DB] Updated lead id=${id}: ${address}, ${city}, ${state} ${zip}`
+  );
 }
 
 /**
@@ -96,13 +113,17 @@ export async function updateMatchStatus(
   status: "no_match" | "error"
 ): Promise<void> {
   const db = getSupabase();
+
   const { error } = await db
     .from("probate_leads")
     .update({ property_match_status: status })
     .eq("id", id);
 
   if (error) {
-    console.error(`[DB] updateMatchStatus error for id=${id}:`, JSON.stringify(error));
+    console.error(
+      `[DB] updateMatchStatus error for id=${id}:`,
+      JSON.stringify(error)
+    );
   } else {
     console.log(`[DB] Set status="${status}" for lead id=${id}`);
   }
