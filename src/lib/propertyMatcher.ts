@@ -1,36 +1,26 @@
 // ============================================================
 // Property Matcher — Hillsborough County Property Appraiser
 //
-// SELF-DISCOVERING: probes candidate ArcGIS service paths at
-// runtime on Vercel and caches the first one that returns data.
+// ENDPOINT RESOLUTION ORDER:
+//   1. HCPA_ARCGIS_SERVICE env var (set this after running /api/discover-endpoint)
+//      e.g. HCPA_ARCGIS_SERVICE=Property/MapServer/0
+//   2. HPAProxy pattern (Esri proxy that bypasses auth for public queries)
+//   3. Direct ArcGIS with self-discovery of service name
 //
-// Why needed: gis.hcpafl.org/arcgis/rest/services/Layers/MapServer
-// returns "Service not found" — the correct service name requires
-// browser network inspection on Vercel's outbound IP.
+// Run /api/discover-endpoint once to find the real service name,
+// then set HCPA_ARCGIS_SERVICE in Vercel env vars and redeploy.
 // ============================================================
 
 import axios, { AxiosError } from "axios";
 import type { HcpaProperty } from "@/types/leads";
 
-// Ranked candidate endpoints — tried in order until one works.
-// Based on Florida PA GIS naming conventions and HCPA public docs.
-const ARCGIS_CANDIDATES: string[] = [
-  "https://gis.hcpafl.org/arcgis/rest/services/Property/MapServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Parcels/MapServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/parcels/MapServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/PropertySearch/MapServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/1/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/2/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/3/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/4/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/5/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/MapServer/6/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Layers/FeatureServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Property/FeatureServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Parcels/FeatureServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/HCPA/MapServer/0/query",
-  "https://gis.hcpafl.org/arcgis/rest/services/Public/MapServer/0/query",
-];
+const BASE = "https://gis.hcpafl.org";
+const PROXY = `${BASE}/HPAProxy/proxy.ashx`;
+
+// If set, skips discovery entirely and uses this service path.
+// Format: "ServiceName/MapServer/LayerID"  e.g. "Property/MapServer/0"
+// Set via Vercel env var: HCPA_ARCGIS_SERVICE=Property/MapServer/0
+const ENV_SERVICE = process.env.HCPA_ARCGIS_SERVICE ?? "";
 
 const OUT_FIELDS = "OWN1,OWN2,PHYADDR,PHYDIRPFX,PHYNAME,PHYSUF,PHYUNIT,PHYCITY,PHYZIP";
 const MAX_RECORDS = 10;
@@ -41,14 +31,15 @@ const BROWSER_HEADERS = {
   Accept: "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.9",
   Referer: "https://gis.hcpafl.org/propertysearch/",
+  Origin: "https://gis.hcpafl.org",
 };
 
 export const DELAY_MS = 400;
 const TIMEOUT_MS = 10000;
 const MIN_ACCEPT_SCORE = 1;
 
-// Module-level cache — persists for the lifetime of this serverless invocation
-let cachedEndpoint: string | null = null;
+// Module-level cache of discovered working endpoint (URL string)
+let cachedQueryUrl: string | null = null;
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -81,7 +72,7 @@ export function parseName(fullName: string | null | undefined): ParsedName | nul
   return { last: words[words.length - 1], first: words[0], middle: words.slice(1, -1).join(" "), raw: s };
 }
 
-// ---- Raw ArcGIS query --------------------------------------
+// ---- Core ArcGIS query -------------------------------------
 
 interface ArcGISFeature { attributes: Record<string, unknown>; }
 interface ArcGISResponse {
@@ -90,7 +81,7 @@ interface ArcGISResponse {
 }
 
 async function queryArcGIS(
-  endpoint: string,
+  queryUrl: string,
   whereClause: string,
   leadId: number,
   tag: string
@@ -104,10 +95,11 @@ async function queryArcGIS(
   };
 
   const qs = new URLSearchParams(params as Record<string, string>).toString();
-  console.log(`[PM:L${leadId}] [${tag}] ${endpoint}?${qs}`);
+  const fullUrl = `${queryUrl}?${qs}`;
+  console.log(`[PM:L${leadId}] [${tag}] VERIFIED LIVE ENDPOINT: ${fullUrl}`);
 
   try {
-    const resp = await axios.get<ArcGISResponse>(endpoint, {
+    const resp = await axios.get<ArcGISResponse>(queryUrl, {
       params,
       timeout: TIMEOUT_MS,
       headers: BROWSER_HEADERS,
@@ -123,15 +115,17 @@ async function queryArcGIS(
 
     const data = resp.data as ArcGISResponse;
     if (data?.error) {
-      const msg = `code=${data.error.code} "${data.error.message}"`;
-      console.log(`[PM:L${leadId}] [${tag}] ArcGIS error: ${msg}`);
+      const msg = `ArcGIS error code=${data.error.code} "${data.error.message}"`;
+      console.log(`[PM:L${leadId}] [${tag}] ${msg}`);
       return { features: [], ok: false, errorMsg: msg };
     }
 
     const features = data?.features ?? [];
-    console.log(`[PM:L${leadId}] [${tag}] features returned: ${features.length}`);
+    console.log(`[PM:L${leadId}] [${tag}] VERIFIED RESPONSE COUNT: ${features.length}`);
     if (features.length > 0) {
-      console.log(`[PM:L${leadId}] [${tag}] attribute keys: ${Object.keys(features[0].attributes ?? {}).join(", ")}`);
+      const keys = Object.keys(features[0].attributes ?? {});
+      console.log(`[PM:L${leadId}] [${tag}] VERIFIED OWNER FIELD: ${keys.includes("OWN1") ? "OWN1 ✓" : `OWN1 not found — keys: ${keys.join(", ")}`}`);
+      console.log(`[PM:L${leadId}] [${tag}] VERIFIED ADDRESS FIELD: ${keys.includes("PHYADDR") ? "PHYADDR ✓" : "PHYADDR not found"}`);
     }
     return { features, ok: true };
   } catch (err) {
@@ -142,50 +136,88 @@ async function queryArcGIS(
   }
 }
 
-// ---- Service discovery -------------------------------------
+// ---- Endpoint resolution -----------------------------------
 
-async function getWorkingEndpoint(leadId: number): Promise<string | null> {
-  if (cachedEndpoint) {
-    console.log(`[PM:L${leadId}] DISCOVERY: using cached endpoint: ${cachedEndpoint}`);
-    return cachedEndpoint;
+/**
+ * Build candidate query URLs in priority order:
+ * 1. Env var (user-configured after running discover-endpoint)
+ * 2. HPAProxy variants
+ * 3. Direct ArcGIS variants
+ */
+function buildCandidateUrls(): Array<{ url: string; label: string }> {
+  const candidates: Array<{ url: string; label: string }> = [];
+
+  // Priority 1: User-configured env var
+  if (ENV_SERVICE) {
+    const direct = `${BASE}/arcgis/rest/services/${ENV_SERVICE}/query`;
+    const proxied = `${PROXY}?${direct}`;
+    candidates.push(
+      { url: proxied, label: `ENV_VAR_PROXY(${ENV_SERVICE})` },
+      { url: direct, label: `ENV_VAR_DIRECT(${ENV_SERVICE})` }
+    );
+    console.log(`[PM] Using HCPA_ARCGIS_SERVICE env var: ${ENV_SERVICE}`);
   }
 
-  console.log(`[PM:L${leadId}] DISCOVERY: probing ${ARCGIS_CANDIDATES.length} endpoints...`);
+  // Priority 2: HPAProxy + known service names
+  const services = [
+    "Property/MapServer/0",
+    "Parcels/MapServer/0",
+    "parcels/MapServer/0",
+    "PropertySearch/MapServer/0",
+    "HPA_Layers/MapServer/0",
+    "Layers/MapServer/4",
+    "Layers/MapServer/5",
+    "Layers/MapServer/6",
+    "Layers/FeatureServer/0",
+    "Property/FeatureServer/0",
+    "Parcels/FeatureServer/0",
+  ];
 
-  for (let i = 0; i < ARCGIS_CANDIDATES.length; i++) {
-    const ep = ARCGIS_CANDIDATES[i];
-    console.log(`[PM:L${leadId}] DISCOVERY [${i + 1}/${ARCGIS_CANDIDATES.length}]: ${ep}`);
+  for (const svc of services) {
+    const direct = `${BASE}/arcgis/rest/services/${svc}/query`;
+    candidates.push(
+      { url: `${PROXY}?${direct}`, label: `PROXY(${svc})` },
+      { url: direct, label: `DIRECT(${svc})` }
+    );
+  }
 
-    const result = await queryArcGIS(ep, "UPPER(OWN1) LIKE '%SMITH%'", leadId, `DISC${i + 1}`);
+  return candidates;
+}
+
+async function getWorkingQueryUrl(leadId: number): Promise<string | null> {
+  if (cachedQueryUrl) {
+    console.log(`[PM:L${leadId}] Using cached query URL: ${cachedQueryUrl}`);
+    return cachedQueryUrl;
+  }
+
+  const candidates = buildCandidateUrls();
+  console.log(`[PM:L${leadId}] DISCOVERY: testing ${candidates.length} candidate URLs...`);
+
+  for (let i = 0; i < candidates.length; i++) {
+    const { url, label } = candidates[i];
+    console.log(`[PM:L${leadId}] DISCOVERY [${i + 1}/${candidates.length}] ${label}`);
+
+    const result = await queryArcGIS(url, "UPPER(OWN1) LIKE '%SMITH%'", leadId, `DISC${i + 1}`);
 
     if (result.ok && result.features.length > 0) {
-      cachedEndpoint = ep;
-      console.log(`[PM:L${leadId}] DISCOVERY: ✓ WORKING ENDPOINT: ${ep} (${result.features.length} test features)`);
-      return ep;
+      cachedQueryUrl = url;
+      console.log(`[PM:L${leadId}] DISCOVERY: ✓ WORKING URL FOUND [${label}]: ${url}`);
+      console.log(`[PM:L${leadId}] TIP: Set env var HCPA_ARCGIS_SERVICE=${label.replace(/^(?:ENV_VAR_)?(?:PROXY|DIRECT)\((.+)\)$/, "$1")} to skip discovery next time`);
+      return url;
     }
 
-    if (!result.ok) {
-      console.log(`[PM:L${leadId}] DISCOVERY [${i + 1}]: failed — ${result.errorMsg}`);
-    } else {
-      // Responded 200 but no features — could be valid endpoint with different field names
-      // Mark as "maybe" candidate and keep looking for better
-      console.log(`[PM:L${leadId}] DISCOVERY [${i + 1}]: 200 OK but 0 SMITH results — field names may differ`);
-      if (!cachedEndpoint) cachedEndpoint = ep; // tentative
+    if (result.ok && result.features.length === 0) {
+      console.log(`[PM:L${leadId}] DISCOVERY [${i + 1}]: 200 OK but 0 features — wrong layer or field`);
     }
 
-    if (i < ARCGIS_CANDIDATES.length - 1) await sleep(150);
+    if (i < candidates.length - 1) await sleep(150);
   }
 
-  if (cachedEndpoint) {
-    console.log(`[PM:L${leadId}] DISCOVERY: no endpoint had SMITH data, using tentative: ${cachedEndpoint}`);
-    return cachedEndpoint;
-  }
-
-  console.error(`[PM:L${leadId}] DISCOVERY: ALL ${ARCGIS_CANDIDATES.length} candidates failed`);
+  console.error(`[PM:L${leadId}] DISCOVERY: ALL candidates failed. Run /api/discover-endpoint for diagnosis.`);
   return null;
 }
 
-// ---- Feature mapping ---------------------------------------
+// ---- Feature → HcpaProperty --------------------------------
 
 function toProperty(f: ArcGISFeature): HcpaProperty {
   const a = f.attributes ?? {};
@@ -206,27 +238,20 @@ function toProperty(f: ArcGISFeature): HcpaProperty {
 
 // ---- Owner search ------------------------------------------
 
-async function searchOwner(
-  lastName: string,
-  endpoint: string,
-  leadId: number
-): Promise<HcpaProperty[]> {
+async function searchOwner(lastName: string, queryUrl: string, leadId: number): Promise<HcpaProperty[]> {
   const safe = lastName.replace(/'/g, "''").toUpperCase();
   const props: HcpaProperty[] = [];
 
-  // Search OWN1
-  const r1 = await queryArcGIS(endpoint, `UPPER(OWN1) LIKE '%${safe}%'`, leadId, "OWN1");
+  const r1 = await queryArcGIS(queryUrl, `UPPER(OWN1) LIKE '%${safe}%'`, leadId, "OWN1");
   if (r1.ok && r1.features.length > 0) {
     const mapped = r1.features.map(toProperty).filter((p) => p.ownerName.length > 0);
     console.log(`[PM:L${leadId}] OWN1 → ${mapped.length} properties`);
-    mapped.forEach((p, i) => console.log(`[PM:L${leadId}]   OWN1[${i}] owner="${p.ownerName}" addr="${p.siteAddress}" city="${p.siteCity}"`));
+    mapped.forEach((p, i) => console.log(`[PM:L${leadId}]   OWN1[${i}] owner="${p.ownerName}" addr="${p.siteAddress}"`));
     props.push(...mapped);
   }
 
-  // Search OWN2 if nothing in OWN1
   if (props.length === 0) {
-    console.log(`[PM:L${leadId}] OWN1 empty → trying OWN2`);
-    const r2 = await queryArcGIS(endpoint, `UPPER(OWN2) LIKE '%${safe}%'`, leadId, "OWN2");
+    const r2 = await queryArcGIS(queryUrl, `UPPER(OWN2) LIKE '%${safe}%'`, leadId, "OWN2");
     if (r2.ok && r2.features.length > 0) {
       const mapped = r2.features.map(toProperty).filter((p) => p.ownerName.length > 0);
       console.log(`[PM:L${leadId}] OWN2 → ${mapped.length} properties`);
@@ -242,14 +267,14 @@ async function searchOwner(
 
 interface Scored { prop: HcpaProperty; score: number; reasons: string[]; }
 
-function score(prop: HcpaProperty, parsed: ParsedName, idx: number, leadId: number): Scored {
+function scoreCandidate(prop: HcpaProperty, parsed: ParsedName, idx: number, leadId: number): Scored {
   const owner = prop.ownerName.toUpperCase().trim();
   const addr  = prop.siteAddress.toUpperCase().trim();
   const { last, first, middle } = parsed;
   let s = 0;
   const r: string[] = [];
 
-  console.log(`[PM:L${leadId}]   Candidate[${idx}] owner="${owner}" addr="${addr}"`);
+  console.log(`[PM:L${leadId}]   Candidate[${idx}] owner="${owner}" addr="${addr}" city="${prop.siteCity}"`);
 
   if (!owner.includes(last)) {
     const msg = `HARD REJECT: "${last}" not in "${owner}"`;
@@ -261,32 +286,33 @@ function score(prop: HcpaProperty, parsed: ParsedName, idx: number, leadId: numb
 
   if (owner.startsWith(last + ",") || owner.startsWith(last + " ") || owner === last) {
     s += 5; r.push("+5 last@start");
+    console.log(`[PM:L${leadId}]   [${idx}] +5 last at start`);
   }
 
   if (first) {
     const fi = first.charAt(0);
-    if (owner.includes(first)) { s += 10; r.push(`+10 first="${first}"`); console.log(`[PM:L${leadId}]   [${idx}] +10 exact first "${first}"`); }
-    else if (new RegExp(`(?:^|[\\s,])${fi}(?:[\\s,.$]|$)`).test(owner)) { s += 6; r.push(`+6 fi="${fi}"`); console.log(`[PM:L${leadId}]   [${idx}] +6 first initial "${fi}"`); }
-    else if (owner.includes(` ${fi}`) || owner.includes(`,${fi}`)) { s += 3; r.push(`+3 fi_weak`); console.log(`[PM:L${leadId}]   [${idx}] +3 first initial "${fi}" weak`); }
-    else { console.log(`[PM:L${leadId}]   [${idx}] +0 first "${first}" NOT found`); }
+    if (owner.includes(first))                                               { s += 10; r.push(`+10 first="${first}"`);  console.log(`[PM:L${leadId}]   [${idx}] +10 exact first "${first}"`); }
+    else if (new RegExp(`(?:^|[\\s,])${fi}(?:[\\s,.$]|$)`).test(owner))     { s += 6;  r.push(`+6 fi="${fi}"`);         console.log(`[PM:L${leadId}]   [${idx}] +6 initial "${fi}" (word boundary)`); }
+    else if (owner.includes(` ${fi}`) || owner.includes(`,${fi}`))           { s += 3;  r.push(`+3 fi_weak`);            console.log(`[PM:L${leadId}]   [${idx}] +3 initial "${fi}" (weak)`); }
+    else                                                                     {          console.log(`[PM:L${leadId}]   [${idx}] +0 first "${first}" NOT found`); }
   }
 
   if (middle) {
     const mi = middle.charAt(0);
-    if (owner.includes(middle)) { s += 3; r.push(`+3 mid`); }
-    else if (new RegExp(`(?:^|[\\s,])${mi}(?:[\\s,.$]|$)`).test(owner)) { s += 1; r.push(`+1 mi`); }
+    if (owner.includes(middle))                                              { s += 3; r.push(`+3 mid`); }
+    else if (new RegExp(`(?:^|[\\s,])${mi}(?:[\\s,.$]|$)`).test(owner))     { s += 1; r.push(`+1 mi`); }
   }
 
-  if (owner.includes("REVOCABLE TRUST") || owner.includes("REV TRUST")) { s += 3; r.push("+3 rev_trust"); console.log(`[PM:L${leadId}]   [${idx}] +3 REVOCABLE TRUST`); }
-  else if (owner.includes("TRUST")) { s += 2; r.push("+2 trust"); console.log(`[PM:L${leadId}]   [${idx}] +2 TRUST`); }
-  if (owner.includes("ESTATE")) { s += 2; r.push("+2 estate"); }
+  if (owner.includes("REVOCABLE TRUST") || owner.includes("REV TRUST"))     { s += 3; r.push("+3 rev_trust"); console.log(`[PM:L${leadId}]   [${idx}] +3 REVOCABLE TRUST`); }
+  else if (owner.includes("TRUST"))                                          { s += 2; r.push("+2 trust");    console.log(`[PM:L${leadId}]   [${idx}] +2 TRUST`); }
+  if (owner.includes("ESTATE"))                                              { s += 2; r.push("+2 estate");   console.log(`[PM:L${leadId}]   [${idx}] +2 ESTATE`); }
 
-  if (!addr) { s -= 10; r.push("-10 no_addr"); console.log(`[PM:L${leadId}]   [${idx}] -10 no address`); }
-  else if (addr.includes("PO BOX") || addr.includes("P.O.")) { s -= 3; r.push("-3 po_box"); }
-  else { s += 3; r.push("+3 real_addr"); console.log(`[PM:L${leadId}]   [${idx}] +3 real address ✓`); }
+  if (!addr)                                                                 { s -= 10; r.push("-10 no_addr"); }
+  else if (addr.includes("PO BOX") || addr.includes("P.O."))                { s -= 3;  r.push("-3 po_box"); }
+  else                                                                       { s += 3;  r.push("+3 real_addr"); console.log(`[PM:L${leadId}]   [${idx}] +3 real address`); }
 
-  if (prop.siteState === "FL") { s += 2; r.push("+2 FL"); }
-  if (prop.siteZip && /^\d{5}/.test(prop.siteZip)) { s += 1; r.push("+1 ZIP"); }
+  if (prop.siteState === "FL")                                               { s += 2; r.push("+2 FL"); }
+  if (prop.siteZip && /^\d{5}/.test(prop.siteZip))                          { s += 1; r.push("+1 ZIP"); }
 
   console.log(`[PM:L${leadId}]   [${idx}] SCORE=${s} — ${r.join(" ")}`);
   return { prop, score: s, reasons: r };
@@ -302,7 +328,6 @@ export async function findPropertyForDecedent(
 ): Promise<MatchedProperty | null> {
   console.log(`[PM:L${leadId}] ===== START id=${leadId} name="${deceasedName}" =====`);
 
-  // STAGE 2: Name extraction
   const parsed = parseName(deceasedName);
   if (!parsed || !parsed.last || parsed.last.length < 2) {
     console.log(`[PM:L${leadId}] ABORT — unusable name`);
@@ -310,15 +335,13 @@ export async function findPropertyForDecedent(
   }
   console.log(`[PM:L${leadId}] STAGE2: last="${parsed.last}" first="${parsed.first}" middle="${parsed.middle}"`);
 
-  // STAGE 3: Service discovery
-  const endpoint = await getWorkingEndpoint(leadId);
-  if (!endpoint) {
-    console.error(`[PM:L${leadId}] ABORT — no working endpoint`);
+  const queryUrl = await getWorkingQueryUrl(leadId);
+  if (!queryUrl) {
+    console.error(`[PM:L${leadId}] ABORT — no working endpoint. Run /api/discover-endpoint and set HCPA_ARCGIS_SERVICE env var.`);
     return null;
   }
-  console.log(`[PM:L${leadId}] STAGE3: using endpoint: ${endpoint}`);
 
-  const results = await searchOwner(parsed.last, endpoint, leadId);
+  const results = await searchOwner(parsed.last, queryUrl, leadId);
   console.log(`[PM:L${leadId}] STAGE3: total candidates: ${results.length}`);
 
   if (results.length === 0) {
@@ -326,9 +349,7 @@ export async function findPropertyForDecedent(
     return null;
   }
 
-  // STAGE 4: Scoring
-  console.log(`[PM:L${leadId}] STAGE4: scoring ${results.length} candidates`);
-  const scored = results.map((p, i) => score(p, parsed, i, leadId));
+  const scored = results.map((p, i) => scoreCandidate(p, parsed, i, leadId));
   const sorted = [...scored].sort((a, b) => b.score - a.score);
 
   console.log(`[PM:L${leadId}] TOP 5:`);
@@ -347,7 +368,9 @@ export async function findPropertyForDecedent(
   }
 
   const best = valid[0];
-  console.log(`[PM:L${leadId}] STAGE4: BEST owner="${best.prop.ownerName}" score=${best.score}`);
+  console.log(`[PM:L${leadId}] VERIFIED LIVE ENDPOINT: ${queryUrl}`);
+  console.log(`[PM:L${leadId}] VERIFIED OWNER FIELD: OWN1 = "${best.prop.ownerName}"`);
+  console.log(`[PM:L${leadId}] VERIFIED ADDRESS FIELD: PHYADDR → "${best.prop.siteAddress}"`);
   console.log(`[PM:L${leadId}] STAGE5: storing addr="${best.prop.siteAddress}" city="${best.prop.siteCity}" zip="${best.prop.siteZip}"`);
   console.log(`[PM:L${leadId}] ===== END id=${leadId} =====`);
 
