@@ -24,7 +24,7 @@ export function getSupabase(): SupabaseClient {
       persistSession: false,
     },
     realtime: {
-      transport: ws,
+      transport: ws as any,
     },
   });
 
