@@ -1,9 +1,11 @@
 // ============================================================
-// /api/match-properties — Property matching for probate leads
+// /api/match-properties — Probate property matching
 //
-// Processes ALL probate rows that have a deceased_name,
-// regardless of current property_match_status.
-// Logs every row — fetched, eligible, skipped, processed.
+// STAGE 1: Fetches ALL probate rows (no status filter on fetch).
+// Logs every row: fetched, skip reason, eligible count.
+// Skips only rows with no deceased_name OR already "matched".
+// Rows with status "no_match" / "error" / null are re-processed.
+// STAGE 5: Logs every Supabase update response.
 // ============================================================
 
 import { NextResponse } from "next/server";
@@ -27,78 +29,94 @@ export async function GET(): Promise<NextResponse> {
   const admin = getSupabaseAdmin();
 
   try {
-    // ---- Step 1: Fetch ALL probate rows (no filter on match status) ----
-    console.log("[MatchRoute] Fetching ALL probate_leads rows...");
+    // ---- STAGE 1: Fetch ALL probate rows with no row limit ----
+    console.log("[MatchRoute] STAGE1: fetching ALL probate_leads rows...");
 
     const { data: allRows, error: fetchErr, count } = await admin
       .from("probate_leads")
-      .select("id,case_number,deceased_name,property_match_status", { count: "exact" })
+      .select("id,case_number,deceased_name,property_match_status", {
+        count: "exact",
+      })
       .order("id", { ascending: true });
+    // NOTE: No .limit(), no .is() filter — fetch everything.
 
     if (fetchErr) {
-      console.error("[MatchRoute] Fetch error:", JSON.stringify(fetchErr));
+      console.error("[MatchRoute] STAGE1 fetch error:", JSON.stringify(fetchErr));
       throw new Error(fetchErr.message);
     }
 
     const rows = (allRows ?? []) as ProbateRow[];
-    console.log(`[MatchRoute] DB total probate rows (count from query): ${count ?? "unknown"}`);
-    console.log(`[MatchRoute] Rows returned in data array: ${rows.length}`);
 
-    // ---- Step 2: Log every row and classify ----
-    const eligible: ProbateRow[] = [];
-    const skippedNoName: ProbateRow[] = [];
-    const skippedAlreadyMatched: ProbateRow[] = [];
+    console.log(`[MatchRoute] STAGE1: Supabase count=${count ?? "unknown"}`);
+    console.log(`[MatchRoute] STAGE1: rows in data array: ${rows.length}`);
 
-    for (const row of rows) {
-      const hasName = row.deceased_name && row.deceased_name.trim().length > 0;
-      const alreadyMatched = row.property_match_status === "matched";
-
-      console.log(
-        `[MatchRoute] Row id=${row.id} case=${row.case_number} deceased="${row.deceased_name}" status="${row.property_match_status}" hasName=${hasName} alreadyMatched=${alreadyMatched}`
-      );
-
-      if (!hasName) {
-        skippedNoName.push(row);
-        console.log(`[MatchRoute]   → SKIP: no deceased_name`);
-        continue;
-      }
-
-      if (alreadyMatched) {
-        skippedAlreadyMatched.push(row);
-        console.log(`[MatchRoute]   → SKIP: already matched`);
-        continue;
-      }
-
-      eligible.push(row);
-      console.log(`[MatchRoute]   → ELIGIBLE for matching`);
-    }
-
-    console.log(`[MatchRoute] Summary:`);
-    console.log(`[MatchRoute]   Total rows fetched:        ${rows.length}`);
-    console.log(`[MatchRoute]   Skipped (no name):         ${skippedNoName.length}`);
-    console.log(`[MatchRoute]   Skipped (already matched): ${skippedAlreadyMatched.length}`);
-    console.log(`[MatchRoute]   Eligible to process:       ${eligible.length}`);
-
-    if (eligible.length === 0) {
-      const msg =
-        rows.length === 0
-          ? "No probate leads in DB. Run ingestion first."
-          : skippedAlreadyMatched.length === rows.length - skippedNoName.length
-          ? "All eligible leads already matched."
-          : "No eligible leads found (all have no deceased_name or are already matched).";
-
-      console.log(`[MatchRoute] Nothing to process: ${msg}`);
+    if (rows.length === 0) {
       return NextResponse.json({
         success: true,
         totalProcessed: 0,
         matched: 0,
         noMatch: 0,
         errors: 0,
-        message: msg,
+        message: "No probate leads in DB. Run ingestion first.",
       } satisfies PropertyMatchResult);
     }
 
-    // ---- Step 3: Process eligible rows ----
+    // ---- Classify every row ----
+    const eligible: ProbateRow[] = [];
+    let skippedNoName = 0;
+    let skippedAlreadyMatched = 0;
+
+    for (const row of rows) {
+      const hasName =
+        row.deceased_name !== null &&
+        row.deceased_name !== undefined &&
+        row.deceased_name.trim().length > 0;
+      const alreadyMatched = row.property_match_status === "matched";
+
+      console.log(
+        `[MatchRoute] STAGE1 row id=${row.id} case=${row.case_number} ` +
+          `deceased="${row.deceased_name ?? "NULL"}" status="${row.property_match_status ?? "null"}" ` +
+          `hasName=${hasName} alreadyMatched=${alreadyMatched}`
+      );
+
+      if (!hasName) {
+        skippedNoName++;
+        console.log(`[MatchRoute]   → SKIP: no deceased_name`);
+        continue;
+      }
+      if (alreadyMatched) {
+        skippedAlreadyMatched++;
+        console.log(`[MatchRoute]   → SKIP: already matched`);
+        continue;
+      }
+
+      eligible.push(row);
+      console.log(`[MatchRoute]   → ELIGIBLE`);
+    }
+
+    console.log(`[MatchRoute] STAGE1 summary:`);
+    console.log(`[MatchRoute]   Total fetched:          ${rows.length}`);
+    console.log(`[MatchRoute]   Skipped (no name):      ${skippedNoName}`);
+    console.log(`[MatchRoute]   Skipped (matched):      ${skippedAlreadyMatched}`);
+    console.log(`[MatchRoute]   Eligible to process:    ${eligible.length}`);
+
+    if (eligible.length === 0) {
+      const detail =
+        skippedAlreadyMatched > 0
+          ? "All eligible leads already matched."
+          : "All probate leads lack a deceased_name — check parser.";
+      console.log(`[MatchRoute] Nothing to process: ${detail}`);
+      return NextResponse.json({
+        success: true,
+        totalProcessed: 0,
+        matched: 0,
+        noMatch: 0,
+        errors: 0,
+        message: detail,
+      } satisfies PropertyMatchResult);
+    }
+
+    // ---- STAGE 2-4: Process each eligible row ----
     let matched = 0;
     let noMatch = 0;
     let errors = 0;
@@ -106,14 +124,24 @@ export async function GET(): Promise<NextResponse> {
     for (let i = 0; i < eligible.length; i++) {
       const lead = eligible[i];
       console.log(
-        `[MatchRoute] Processing ${i + 1}/${eligible.length}: id=${lead.id} case=${lead.case_number} deceased="${lead.deceased_name}"`
+        `[MatchRoute] Processing ${i + 1}/${eligible.length}: ` +
+          `id=${lead.id} case=${lead.case_number} deceased="${lead.deceased_name}"`
       );
 
       try {
-        const property = await findPropertyForDecedent(lead.deceased_name, lead.id);
+        const property = await findPropertyForDecedent(
+          lead.deceased_name,
+          lead.id
+        );
 
         if (property) {
-          const { error: updateErr } = await admin
+          // ---- STAGE 5: Update matched address ----
+          console.log(
+            `[MatchRoute] STAGE5 updating lead ${lead.id} with: ` +
+              `addr="${property.address}" city="${property.city}" zip="${property.zip}"`
+          );
+
+          const { data: updateData, error: updateErr } = await admin
             .from("probate_leads")
             .update({
               matched_property_address: property.address,
@@ -122,25 +150,37 @@ export async function GET(): Promise<NextResponse> {
               matched_property_zip: property.zip,
               property_match_status: "matched",
             })
-            .eq("id", lead.id);
+            .eq("id", lead.id)
+            .select("id");
 
           if (updateErr) {
-            console.error(`[MatchRoute] Update error lead ${lead.id}:`, JSON.stringify(updateErr));
+            console.error(
+              `[MatchRoute] STAGE5 update ERROR lead ${lead.id}:`,
+              JSON.stringify(updateErr)
+            );
             errors++;
           } else {
-            console.log(`[MatchRoute] ✓ MATCHED lead ${lead.id}: "${property.address}, ${property.city}"`);
+            console.log(
+              `[MatchRoute] STAGE5 update OK lead ${lead.id}: ` +
+                `rows affected=${updateData?.length ?? 0}`
+            );
             matched++;
           }
         } else {
-          const { error: noMatchErr } = await admin
+          // Mark no_match
+          const { error: nmErr } = await admin
             .from("probate_leads")
             .update({ property_match_status: "no_match" })
             .eq("id", lead.id);
 
-          if (noMatchErr) {
-            console.error(`[MatchRoute] no_match update error lead ${lead.id}:`, JSON.stringify(noMatchErr));
+          if (nmErr) {
+            console.error(
+              `[MatchRoute] no_match update error lead ${lead.id}:`,
+              JSON.stringify(nmErr)
+            );
+          } else {
+            console.log(`[MatchRoute] ✗ no_match lead ${lead.id}`);
           }
-          console.log(`[MatchRoute] ✗ no_match lead ${lead.id}`);
           noMatch++;
         }
       } catch (err) {
@@ -150,8 +190,7 @@ export async function GET(): Promise<NextResponse> {
         await admin
           .from("probate_leads")
           .update({ property_match_status: "error" })
-          .eq("id", lead.id)
-          .then(({ error: e }) => { if (e) console.error(`[MatchRoute] error-status update failed:`, e); });
+          .eq("id", lead.id);
 
         errors++;
       }
@@ -168,7 +207,10 @@ export async function GET(): Promise<NextResponse> {
       matched,
       noMatch,
       errors,
-      message: `Completed in ${elapsed}s. Fetched=${rows.length} Eligible=${eligible.length} SkippedNoName=${skippedNoName.length} SkippedAlreadyMatched=${skippedAlreadyMatched.length}`,
+      message:
+        `Done in ${elapsed}s — ` +
+        `Fetched=${rows.length} Eligible=${eligible.length} ` +
+        `SkippedNoName=${skippedNoName} SkippedAlreadyMatched=${skippedAlreadyMatched}`,
     };
 
     console.log("[MatchRoute] ✓ Done:", result);
