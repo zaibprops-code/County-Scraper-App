@@ -1,13 +1,25 @@
 // ============================================================
-// Supabase client for the Railway worker.
-// Uses service role key — always bypasses RLS.
+// Supabase client — Railway worker (pure CRUD, no realtime).
 //
-// fetchEligibleLeads fetches ALL probate rows then filters
-// in JavaScript to avoid PostgREST NULL-handling quirks where
-// .neq() and .or() both silently drop NULL rows in some versions.
+// WHY THE WEBSOCKET ERROR HAPPENED:
+// @supabase/supabase-js v2 always constructs a RealtimeClient
+// inside createClient(), even if you never call .channel().
+// RealtimeClient tries to open a WebSocket connection on first use.
+// Node 20 does not have a global WebSocket (it was added in Node 21),
+// so supabase-js logs: "Using the ws package is deprecated..."
+// and may fail if ws is not installed.
+//
+// THE FIX:
+// 1. Install ws@8 (required by supabase-js for Node < 21).
+// 2. Pass ws as the realtime transport in createClient options.
+// 3. Disable auth persistence — not needed in a worker.
+// 4. Use Node 20 built-in fetch explicitly.
+// 5. Fetch all rows in JS and filter client-side to avoid
+//    PostgREST NULL-handling bugs with .neq()/.or().
 // ============================================================
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import * as ws from "ws";
 
 let _client: SupabaseClient | null = null;
 
@@ -20,15 +32,43 @@ export function getSupabase(): SupabaseClient {
 
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  if (!url) throw new Error("Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
-  if (!key) throw new Error("Missing env: SUPABASE_SERVICE_ROLE_KEY");
+  if (!url) {
+    throw new Error(
+      "Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL). " +
+        "Set this in Railway → Variables."
+    );
+  }
+  if (!key) {
+    throw new Error(
+      "Missing env: SUPABASE_SERVICE_ROLE_KEY. " +
+        "Set this in Railway → Variables."
+    );
+  }
 
   console.log(`[DB] Connecting to Supabase: ${url}`);
 
   _client = createClient(url, key, {
-    auth: { autoRefreshToken: false, persistSession: false },
+    auth: {
+      // Worker never needs an authenticated session
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    realtime: {
+      // Provide ws so Node 20 does not complain about missing WebSocket.
+      // We never call .channel() so this connection is never actually opened.
+      transport: ws.WebSocket as unknown as new (
+        url: string,
+        protocols?: string | string[]
+      ) => WebSocket,
+    },
+    global: {
+      // Use Node 20 built-in fetch (available since Node 18)
+      fetch: fetch,
+    },
   });
 
+  console.log("[DB] Supabase client created (realtime transport=ws, no sessions)");
   return _client;
 }
 
@@ -40,23 +80,26 @@ export interface ProbateLead {
 }
 
 /**
- * Fetch all probate leads eligible for property matching.
+ * Fetch ALL probate rows, then filter eligibles in JavaScript.
  *
- * Eligible = deceased_name is NOT NULL/empty
+ * WHY JS FILTERING (not PostgREST):
+ * PostgREST .neq("col","val") translates to SQL `col != 'val'`
+ * which silently excludes NULLs (SQL NULL != anything = NULL/false).
+ * .or() with .is.null has also been observed to drop rows in some
+ * supabase-js/PostgREST version combinations.
+ * Fetching all and filtering in JS is the only 100% reliable approach.
+ *
+ * Eligible = deceased_name is not null/empty
  *            AND property_match_status is NOT exactly "matched"
  *
- * Includes rows with status: null, "", "no_match", "error",
- * "pending", "processing", or any other non-"matched" value.
- *
- * Filtering is done in JavaScript (not PostgREST) to avoid
- * the well-known issue where .neq() and .or() silently exclude
- * NULL rows in PostgREST SQL translation.
+ * Included statuses: null, "", "no_match", "error", "pending",
+ *                    "processing", any other non-"matched" value.
  */
 export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
   const db = getSupabase();
 
-  // Fetch ALL rows — no server-side filter at all
-  console.log("[DB] Fetching ALL probate_leads rows (no filter)...");
+  // ---- Step 1: Fetch ALL rows with no filter ----
+  console.log("[DB] Fetching ALL probate_leads (no server-side filter)...");
 
   const { data, error, count } = await db
     .from("probate_leads")
@@ -74,35 +117,47 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
   console.log(`[DB] ── Total rows in probate_leads: ${count ?? all.length}`);
 
   if (all.length === 0) {
-    console.warn("[DB] Table is empty. Run ingestion first.");
+    console.warn("[DB] Table is empty — run ingestion first.");
     return [];
   }
 
-  // Log all statuses for visibility
-  const statusCounts: Record<string, number> = {};
+  // ---- Step 2: Log status breakdown ----
+  const statusMap: Record<string, number> = {};
   for (const row of all) {
-    const s = row.property_match_status ?? "NULL";
-    statusCounts[s] = (statusCounts[s] ?? 0) + 1;
+    const key = row.property_match_status === null ? "NULL" : `"${row.property_match_status}"`;
+    statusMap[key] = (statusMap[key] ?? 0) + 1;
   }
-  console.log("[DB] ── Status breakdown:", JSON.stringify(statusCounts));
+  console.log("[DB] ── Status breakdown:", JSON.stringify(statusMap));
 
-  // Filter 1: must have a deceased_name
+  // ---- Step 3: Filter — must have deceased_name ----
   const withName = all.filter(
-    (r) => r.deceased_name !== null && r.deceased_name !== undefined && r.deceased_name.trim().length > 0
+    (r) =>
+      r.deceased_name !== null &&
+      r.deceased_name !== undefined &&
+      r.deceased_name.trim().length > 0
   );
   console.log(`[DB] ── Rows with deceased_name: ${withName.length}`);
 
-  // Filter 2: exclude only rows where status === "matched" (exact string match)
-  const alreadyMatched = withName.filter((r) => r.property_match_status === "matched");
-  console.log(`[DB] ── Rows excluded (already matched): ${alreadyMatched.length}`);
+  // ---- Step 4: Exclude already matched ----
+  const alreadyMatched = withName.filter(
+    (r) => r.property_match_status === "matched"
+  );
+  console.log(`[DB] ── Rows excluded (status === "matched"): ${alreadyMatched.length}`);
 
-  const eligible = withName.filter((r) => r.property_match_status !== "matched");
+  // ---- Step 5: Final eligible set ----
+  // Include everything that is NOT exactly the string "matched"
+  // This covers: null, "no_match", "error", "pending", "", undefined, etc.
+  const eligible = withName.filter(
+    (r) => r.property_match_status !== "matched"
+  );
   console.log(`[DB] ── Final eligible rows: ${eligible.length}`);
 
-  // Log first 5 eligible rows for verification
+  // Log first 5 for verification
   eligible.slice(0, 5).forEach((r) =>
     console.log(
-      `[DB]    id=${r.id} case=${r.case_number} status="${r.property_match_status ?? "NULL"}" deceased="${r.deceased_name}"`
+      `[DB]    id=${r.id} case=${r.case_number} ` +
+        `status=${r.property_match_status === null ? "NULL" : `"${r.property_match_status}"`} ` +
+        `deceased="${r.deceased_name}"`
     )
   );
 
@@ -137,7 +192,9 @@ export async function updateMatchedProperty(
     throw new Error(error.message);
   }
 
-  console.log(`[DB] ✓ Updated id=${id}: "${address}, ${city}, ${state} ${zip ?? ""}"`);
+  console.log(
+    `[DB] ✓ Updated id=${id}: "${address}, ${city}, ${state} ${zip ?? ""}"`
+  );
 }
 
 /**
@@ -155,7 +212,10 @@ export async function updateMatchStatus(
     .eq("id", id);
 
   if (error) {
-    console.error(`[DB] updateMatchStatus error id=${id}:`, JSON.stringify(error));
+    console.error(
+      `[DB] updateMatchStatus error id=${id}:`,
+      JSON.stringify(error)
+    );
   } else {
     console.log(`[DB] Set status="${status}" for id=${id}`);
   }
