@@ -1,9 +1,13 @@
 // ============================================================
 // Railway Worker — Express HTTP Server
+//
 // Endpoints:
-//   GET  /health         — liveness check (no auth)
-//   GET  /status         — running state
-//   POST /match-probate  — trigger matching (GET also accepted)
+//   GET  /health         liveness probe (no auth required)
+//   GET  /status         current running state
+//   POST /match-probate  trigger property matching
+//   GET  /match-probate  same — allows quick browser test
+//
+// Auth: Authorization: Bearer <WORKER_API_KEY>
 // ============================================================
 
 import express, { Request, Response, NextFunction } from "express";
@@ -22,51 +26,56 @@ app.use(express.json());
 const PORT = parseInt(process.env.PORT ?? "3001", 10);
 const WORKER_API_KEY = process.env.WORKER_API_KEY ?? "";
 
-// ---- Startup validation ------------------------------------
+// ── Startup validation ───────────────────────────────────────
 
 function validateEnv(): void {
-  console.log("[Worker] ===== Startup Environment Check =====");
-  console.log(`[Worker] Node version: ${process.version}`);
-  console.log(`[Worker] PORT: ${PORT}`);
+  console.log("[Worker] ══════════════════════════════════════");
+  console.log("[Worker] Hillsborough Probate Worker starting");
+  console.log("[Worker] ══════════════════════════════════════");
+  console.log(`[Worker] Node version : ${process.version}`);
+  console.log(`[Worker] PORT         : ${PORT}`);
 
-  const supabaseUrl =
+  const supaUrl =
     process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-  console.log(`[Worker] SUPABASE_URL: ${supabaseUrl ? `✓ ${supabaseUrl}` : "✗ MISSING"}`);
   console.log(
-    `[Worker] SUPABASE_SERVICE_ROLE_KEY: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? "✓ set" : "✗ MISSING"}`
+    `[Worker] SUPABASE_URL : ${supaUrl ? `✓ ${supaUrl}` : "✗ MISSING — set in Railway Variables"}`
   );
   console.log(
-    `[Worker] WORKER_API_KEY: ${WORKER_API_KEY ? "✓ set" : "⚠ not set (all requests allowed)"}`
+    `[Worker] SERVICE_KEY  : ${process.env.SUPABASE_SERVICE_ROLE_KEY ? "✓ set" : "✗ MISSING — set in Railway Variables"}`
   );
   console.log(
-    `[Worker] CHROMIUM_PATH: ${process.env.CHROMIUM_PATH ?? "auto-detect"}`
+    `[Worker] API_KEY      : ${WORKER_API_KEY ? "✓ set" : "⚠  not set — all requests accepted"}`
+  );
+  console.log(
+    `[Worker] CHROMIUM     : ${process.env.CHROMIUM_PATH ?? "auto-detect"}`
+  );
+  console.log(
+    `[Worker] HEADFUL      : ${process.env.PLAYWRIGHT_HEADFUL ?? "false"}`
   );
 
-  // Log which Chromium binaries exist
-  const chromiumPaths = [
+  // List Chromium binaries present in container
+  const bins = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
   ];
-  for (const p of chromiumPaths) {
-    if (fs.existsSync(p)) {
-      console.log(`[Worker] ✓ Chromium found: ${p}`);
-    }
+  for (const b of bins) {
+    if (fs.existsSync(b)) console.log(`[Worker] Chromium binary  : ✓ ${b}`);
   }
 
-  // Confirm ws package is available
+  // Confirm ws package resolves
   try {
-    require("ws");
-    console.log("[Worker] ✓ ws package available (WebSocket support for Node 20)");
+    require.resolve("ws");
+    console.log("[Worker] ws package       : ✓ resolved (Node 20 WebSocket fix active)");
   } catch {
-    console.warn("[Worker] ⚠ ws package not found — install ws@8");
+    console.warn("[Worker] ws package       : ✗ NOT FOUND — run npm install");
   }
 
-  console.log("[Worker] ===== End Startup Check =====");
+  console.log("[Worker] ══════════════════════════════════════");
 }
 
-// ---- Auth middleware ----------------------------------------
+// ── Auth middleware ──────────────────────────────────────────
 
 function requireApiKey(
   req: Request,
@@ -74,19 +83,21 @@ function requireApiKey(
   next: NextFunction
 ): void {
   if (!WORKER_API_KEY) {
+    // No key configured — open access (acceptable for private Railway service)
     next();
     return;
   }
-  const token = (req.headers.authorization ?? "").replace("Bearer ", "").trim();
+  const header = req.headers.authorization ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : header.trim();
   if (token !== WORKER_API_KEY) {
-    console.warn(`[Auth] Rejected — invalid API key`);
+    console.warn("[Auth] Request rejected — invalid API key");
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
   next();
 }
 
-// ---- Health ------------------------------------------------
+// ── Health ──────────────────────────────────────────────────
 
 app.get("/health", (_req: Request, res: Response) => {
   res.json({
@@ -95,22 +106,22 @@ app.get("/health", (_req: Request, res: Response) => {
     service: "hillsborough-probate-worker",
     node: process.version,
     env: {
-      supabaseUrl: !!(
+      supabaseConfigured: !!(
         process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
       ),
-      supabaseKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+      serviceKeyConfigured: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
       apiKeySet: !!WORKER_API_KEY,
     },
   });
 });
 
-// ---- Status ------------------------------------------------
+// ── Status ──────────────────────────────────────────────────
 
 app.get("/status", requireApiKey, (_req: Request, res: Response) => {
   res.json({ running: isRunning, timestamp: new Date().toISOString() });
 });
 
-// ---- Matching run ------------------------------------------
+// ── Matching run ─────────────────────────────────────────────
 
 let isRunning = false;
 
@@ -123,15 +134,15 @@ async function runMatching(): Promise<{
   elapsed: string;
 }> {
   const t0 = Date.now();
-  console.log("[Worker] ===== START matching run =====");
+  console.log("[Worker] ══ START matching run ══");
 
-  // Pre-warm Chromium
+  // Pre-warm browser so first lead doesn't pay the launch cost
   console.log("[Worker] Pre-warming Chromium...");
   await launchBrowser();
   console.log("[Worker] Chromium ready");
 
   const leads = await fetchEligibleLeads();
-  console.log(`[Worker] Processing ${leads.length} eligible lead(s)`);
+  console.log(`[Worker] Will process ${leads.length} eligible lead(s)`);
 
   let matched = 0;
   let noMatch = 0;
@@ -141,12 +152,14 @@ async function runMatching(): Promise<{
   for (let i = 0; i < leads.length; i++) {
     const lead = leads[i];
     console.log(
-      `[Worker] [${i + 1}/${leads.length}] id=${lead.id} case=${lead.case_number} deceased="${lead.deceased_name}"`
+      `[Worker] ── [${i + 1}/${leads.length}] id=${lead.id} ` +
+        `case=${lead.case_number} deceased="${lead.deceased_name}"`
     );
 
+    // Parse name
     const parsed = parseName(lead.deceased_name);
     if (!parsed || !parsed.last || parsed.last.length < 2) {
-      console.log(`[Worker] SKIP id=${lead.id}: unusable name`);
+      console.log(`[Worker] SKIP id=${lead.id}: cannot parse usable last name`);
       await updateMatchStatus(lead.id, "no_match");
       skipped++;
       noMatch++;
@@ -155,7 +168,8 @@ async function runMatching(): Promise<{
 
     const searchStr = buildSearchString(parsed);
     console.log(
-      `[Worker] Search: "${searchStr}" (last="${parsed.last}" first="${parsed.first}")`
+      `[Worker] Search string: "${searchStr}"  ` +
+        `(last="${parsed.last}" first="${parsed.first}" middle="${parsed.middle}")`
     );
 
     try {
@@ -163,7 +177,8 @@ async function runMatching(): Promise<{
 
       if (result) {
         console.log(
-          `[Worker] ✓ MATCHED id=${lead.id}: "${result.address}, ${result.city}, ${result.state} ${result.zip ?? ""}"`
+          `[Worker] ✓ MATCHED id=${lead.id}: ` +
+            `"${result.address}, ${result.city}, ${result.state} ${result.zip ?? ""}"`
         );
         await updateMatchedProperty(
           lead.id,
@@ -185,16 +200,16 @@ async function runMatching(): Promise<{
       errors++;
     }
 
-    // Respectful delay between requests
+    // Polite delay between HCPA requests
     if (i < leads.length - 1) {
-      const delay = 2000 + Math.random() * 1000;
-      console.log(`[Worker] Waiting ${Math.round(delay)}ms before next lead...`);
-      await new Promise((r) => setTimeout(r, delay));
+      const delayMs = 2000 + Math.round(Math.random() * 1000);
+      console.log(`[Worker] Waiting ${delayMs}ms before next lead...`);
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  const result = {
+  const summary = {
     totalFetched: leads.length,
     totalProcessed: leads.length - skipped,
     matched,
@@ -203,18 +218,21 @@ async function runMatching(): Promise<{
     elapsed: `${elapsed}s`,
   };
 
-  console.log("[Worker] ===== DONE =====", result);
-  return result;
+  console.log("[Worker] ══ DONE ══", summary);
+  return summary;
 }
+
+// ── /match-probate endpoint ──────────────────────────────────
 
 app.all(
   "/match-probate",
   requireApiKey,
   async (_req: Request, res: Response) => {
     if (isRunning) {
+      console.log("[Worker] Already running — rejecting concurrent request");
       res.status(409).json({
         error: "Matching already in progress",
-        message: "A run is active. Wait for it to complete.",
+        message: "Wait for the current run to finish, then try again.",
       });
       return;
     }
@@ -227,22 +245,24 @@ app.all(
       res.json({ success: true, ...result });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error("[Worker] Fatal:", msg);
+      console.error("[Worker] Fatal matching error:", msg);
       res.status(500).json({ success: false, error: msg });
     } finally {
       isRunning = false;
+      // Free memory after each run
       await closeBrowser();
+      console.log("[Worker] Browser closed — ready for next request");
     }
   }
 );
 
-// ---- Start -------------------------------------------------
+// ── Start server ─────────────────────────────────────────────
 
 validateEnv();
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Worker] Listening on port ${PORT}`);
+  console.log(`[Worker] Listening on 0.0.0.0:${PORT}`);
   console.log(
-    `[Worker] Endpoints: GET /health  GET /status  POST /match-probate`
+    "[Worker] Available: GET /health  GET /status  POST /match-probate"
   );
 });
