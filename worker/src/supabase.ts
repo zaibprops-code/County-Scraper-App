@@ -2,13 +2,9 @@
 // Supabase client for the Railway worker.
 // Uses service role key — always bypasses RLS.
 //
-// FIXES:
-// 1. Accepts both SUPABASE_URL and NEXT_PUBLIC_SUPABASE_URL
-//    so Railway env vars don't need to match Vercel naming exactly.
-// 2. Replaces .neq("property_match_status", "matched") with an
-//    explicit OR filter that includes NULL rows — PostgREST's neq
-//    operator excludes NULLs in SQL, so rows never yet attempted
-//    (status = NULL) were silently dropped.
+// fetchEligibleLeads fetches ALL probate rows then filters
+// in JavaScript to avoid PostgREST NULL-handling quirks where
+// .neq() and .or() both silently drop NULL rows in some versions.
 // ============================================================
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -18,26 +14,14 @@ let _client: SupabaseClient | null = null;
 export function getSupabase(): SupabaseClient {
   if (_client) return _client;
 
-  // Accept either naming convention so Railway and Vercel both work
   const url =
     process.env.SUPABASE_URL ||
     process.env.NEXT_PUBLIC_SUPABASE_URL;
 
-  const key =
-    process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  if (!url) {
-    throw new Error(
-      "Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL). " +
-      "Set this in Railway → Variables."
-    );
-  }
-  if (!key) {
-    throw new Error(
-      "Missing env: SUPABASE_SERVICE_ROLE_KEY. " +
-      "Set this in Railway → Variables."
-    );
-  }
+  if (!url) throw new Error("Missing env: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+  if (!key) throw new Error("Missing env: SUPABASE_SERVICE_ROLE_KEY");
 
   console.log(`[DB] Connecting to Supabase: ${url}`);
 
@@ -58,96 +42,71 @@ export interface ProbateLead {
 /**
  * Fetch all probate leads eligible for property matching.
  *
- * Eligible = deceased_name is NOT NULL
- *            AND property_match_status is NOT 'matched'
+ * Eligible = deceased_name is NOT NULL/empty
+ *            AND property_match_status is NOT exactly "matched"
  *
- * IMPORTANT: We use .or("property_match_status.is.null,...") instead of
- * .neq("property_match_status","matched") because PostgREST's neq translates
- * to SQL != which excludes NULLs — rows with status=NULL (never attempted)
- * would be silently dropped, returning 0 eligible rows even when leads exist.
+ * Includes rows with status: null, "", "no_match", "error",
+ * "pending", "processing", or any other non-"matched" value.
+ *
+ * Filtering is done in JavaScript (not PostgREST) to avoid
+ * the well-known issue where .neq() and .or() silently exclude
+ * NULL rows in PostgREST SQL translation.
  */
 export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
   const db = getSupabase();
 
-  // Step 1: log raw total with NO filters to verify connection + table
-  const { count: rawCount, error: rawErr } = await db
-    .from("probate_leads")
-    .select("*", { count: "exact", head: true });
+  // Fetch ALL rows — no server-side filter at all
+  console.log("[DB] Fetching ALL probate_leads rows (no filter)...");
 
-  if (rawErr) {
-    console.error("[DB] Raw count error:", JSON.stringify(rawErr));
-    throw new Error(rawErr.message);
-  }
-  console.log(`[DB] Total rows in probate_leads (no filter): ${rawCount ?? "error"}`);
-
-  if ((rawCount ?? 0) === 0) {
-    console.warn(
-      "[DB] probate_leads table is empty. " +
-      "Run ingestion on the Vercel dashboard first, then trigger matching."
-    );
-    return [];
-  }
-
-  // Step 2: log how many have a deceased_name
-  const { count: nameCount, error: nameErr } = await db
-    .from("probate_leads")
-    .select("*", { count: "exact", head: true })
-    .not("deceased_name", "is", null);
-
-  if (nameErr) {
-    console.error("[DB] Name count error:", JSON.stringify(nameErr));
-  } else {
-    console.log(`[DB] Rows with non-null deceased_name: ${nameCount ?? "error"}`);
-  }
-
-  // Step 3: log how many are already matched
-  const { count: matchedCount, error: matchedErr } = await db
-    .from("probate_leads")
-    .select("*", { count: "exact", head: true })
-    .eq("property_match_status", "matched");
-
-  if (matchedErr) {
-    console.error("[DB] Matched count error:", JSON.stringify(matchedErr));
-  } else {
-    console.log(`[DB] Rows already matched: ${matchedCount ?? "error"}`);
-  }
-
-  // Step 4: fetch eligible rows
-  // Use .or() to correctly handle NULL status alongside other non-matched values.
-  // SQL equivalent:
-  //   WHERE deceased_name IS NOT NULL
-  //   AND (property_match_status IS NULL
-  //        OR property_match_status = 'no_match'
-  //        OR property_match_status = 'error')
   const { data, error, count } = await db
     .from("probate_leads")
     .select("id,case_number,deceased_name,property_match_status", {
       count: "exact",
     })
-    .not("deceased_name", "is", null)
-    .or(
-      "property_match_status.is.null," +
-      "property_match_status.eq.no_match," +
-      "property_match_status.eq.error"
-    )
     .order("id", { ascending: true });
 
   if (error) {
-    console.error("[DB] fetchEligibleLeads error:", JSON.stringify(error));
+    console.error("[DB] Fetch error:", JSON.stringify(error));
     throw new Error(error.message);
   }
 
-  const rows = (data ?? []) as ProbateLead[];
-  console.log(`[DB] Eligible leads (null/no_match/error status + has name): ${count ?? rows.length}`);
+  const all = (data ?? []) as ProbateLead[];
+  console.log(`[DB] ── Total rows in probate_leads: ${count ?? all.length}`);
 
-  // Log first few for verification
-  rows.slice(0, 3).forEach((r) =>
+  if (all.length === 0) {
+    console.warn("[DB] Table is empty. Run ingestion first.");
+    return [];
+  }
+
+  // Log all statuses for visibility
+  const statusCounts: Record<string, number> = {};
+  for (const row of all) {
+    const s = row.property_match_status ?? "NULL";
+    statusCounts[s] = (statusCounts[s] ?? 0) + 1;
+  }
+  console.log("[DB] ── Status breakdown:", JSON.stringify(statusCounts));
+
+  // Filter 1: must have a deceased_name
+  const withName = all.filter(
+    (r) => r.deceased_name !== null && r.deceased_name !== undefined && r.deceased_name.trim().length > 0
+  );
+  console.log(`[DB] ── Rows with deceased_name: ${withName.length}`);
+
+  // Filter 2: exclude only rows where status === "matched" (exact string match)
+  const alreadyMatched = withName.filter((r) => r.property_match_status === "matched");
+  console.log(`[DB] ── Rows excluded (already matched): ${alreadyMatched.length}`);
+
+  const eligible = withName.filter((r) => r.property_match_status !== "matched");
+  console.log(`[DB] ── Final eligible rows: ${eligible.length}`);
+
+  // Log first 5 eligible rows for verification
+  eligible.slice(0, 5).forEach((r) =>
     console.log(
-      `[DB]   id=${r.id} case=${r.case_number} deceased="${r.deceased_name}" status="${r.property_match_status ?? "null"}"`
+      `[DB]    id=${r.id} case=${r.case_number} status="${r.property_match_status ?? "NULL"}" deceased="${r.deceased_name}"`
     )
   );
 
-  return rows;
+  return eligible;
 }
 
 /**
@@ -174,16 +133,11 @@ export async function updateMatchedProperty(
     .eq("id", id);
 
   if (error) {
-    console.error(
-      `[DB] updateMatchedProperty error for id=${id}:`,
-      JSON.stringify(error)
-    );
+    console.error(`[DB] updateMatchedProperty error id=${id}:`, JSON.stringify(error));
     throw new Error(error.message);
   }
 
-  console.log(
-    `[DB] ✓ Updated lead id=${id}: "${address}, ${city}, ${state} ${zip ?? ""}"`
-  );
+  console.log(`[DB] ✓ Updated id=${id}: "${address}, ${city}, ${state} ${zip ?? ""}"`);
 }
 
 /**
@@ -201,11 +155,8 @@ export async function updateMatchStatus(
     .eq("id", id);
 
   if (error) {
-    console.error(
-      `[DB] updateMatchStatus error for id=${id}:`,
-      JSON.stringify(error)
-    );
+    console.error(`[DB] updateMatchStatus error id=${id}:`, JSON.stringify(error));
   } else {
-    console.log(`[DB] Set status="${status}" for lead id=${id}`);
+    console.log(`[DB] Set status="${status}" for id=${id}`);
   }
 }
