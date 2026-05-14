@@ -1,14 +1,13 @@
 # ============================================================
 # Hillsborough Probate Worker — Railway Dockerfile
-# Node 20 + Playwright Chromium for headless browser automation
+# Node 20 LTS + Chromium (system) + ws for WebSocket support
 # ============================================================
 
 FROM node:20-bookworm-slim
 
-# Install system dependencies required by Playwright Chromium
-RUN apt-get update && apt-get install -y \
+# ── System Chromium + dependencies ──────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
-    chromium-driver \
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -30,36 +29,53 @@ RUN apt-get update && apt-get install -y \
     libasound2 \
     libatspi2.0-0 \
     fonts-liberation \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Playwright to use system Chromium
+# ── Playwright: use system Chromium, skip bundled download ──
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/bin
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV CHROMIUM_PATH=/usr/bin/chromium
 
+# ── Verify Chromium binary exists at build time ─────────────
+RUN test -f /usr/bin/chromium && echo "✓ /usr/bin/chromium present" \
+    || (echo "✗ /usr/bin/chromium NOT found" && exit 1)
+
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
+# ── Copy package manifest ───────────────────────────────────
+COPY package.json ./
 
-# Install dependencies
-# (use npm install instead of npm ci because lockfile may not exist)
-RUN npm install --omit=dev
+# Cache-bust argument — change value to force fresh npm install.
+# On Railway: set a Build Argument CACHE_BUST with today's date.
+ARG CACHE_BUST=1
+RUN echo "[Docker] Cache bust value: ${CACHE_BUST}"
 
-# Copy TypeScript source and config
+# ── Install ALL dependencies (including ws + devDeps for tsc) ─
+RUN npm install
+
+# ── Copy source ─────────────────────────────────────────────
 COPY tsconfig.json ./
 COPY src/ ./src/
 
-# Install temporary build dependencies
-RUN npm install --save-dev typescript @types/node @types/express ts-node
+# ── Verify ws package is present before compile ─────────────
+RUN node -e "require('ws'); console.log('✓ ws package OK')"
 
-# Build TypeScript
-RUN npm run build
+# ── Compile TypeScript ───────────────────────────────────────
+RUN npx tsc
 
-# Remove dev dependencies after build
+# ── Prune dev dependencies ───────────────────────────────────
 RUN npm prune --omit=dev
 
-# Railway injects PORT automatically
+# ── Verify compiled output ───────────────────────────────────
+RUN ls -la dist/ && echo "✓ dist/ contents verified"
+RUN test -f dist/index.js && echo "✓ dist/index.js present" \
+    || (echo "✗ dist/index.js MISSING — tsc failed" && exit 1)
+
+# ── Runtime: ws must still be present after prune ───────────
+RUN node -e "require('ws'); console.log('✓ ws available at runtime')"
+
+# Railway injects PORT automatically; default 3001 for local dev
 EXPOSE 3001
 
 CMD ["node", "dist/index.js"]
