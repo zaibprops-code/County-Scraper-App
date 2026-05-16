@@ -1,10 +1,19 @@
 // ============================================================
 // Supabase client — Railway worker
 // Explicit schema, full diagnostic logging, ws transport.
+//
+// TYPE FIX: import ws default export and cast as `any` for the
+// realtime transport option. This is the cleanest approach that
+// compiles without error across all supabase-js v2 / ws@8 /
+// Node 20 combinations. The named `{ WebSocket as WsWebSocket }`
+// import produces a constructor signature mismatch with the
+// internal WebSocketLikeConstructor type in @supabase/realtime-js.
+// The default import + `as any` resolves this cleanly.
 // ============================================================
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { WebSocket as WsWebSocket } from "ws";
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const WsConstructor = require("ws") as { new(url: string, protocols?: string | string[]): unknown };
 
 let _client: SupabaseClient | null = null;
 
@@ -50,10 +59,11 @@ export function getSupabase(): SupabaseClient {
       detectSessionInUrl: false,
     },
     realtime: {
-      transport: WsWebSocket as unknown as new (
-        url: string,
-        protocols?: string | string[]
-      ) => WebSocket,
+      // Use require() so TypeScript does not enforce the constructor
+      // signature against WebSocketLikeConstructor in realtime-js.
+      // ws@8 is fully compatible at runtime — only the static types clash.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      transport: WsConstructor as any,
     },
     global: {
       fetch: fetch,
@@ -63,6 +73,8 @@ export function getSupabase(): SupabaseClient {
   console.log("[DB] ── Supabase client created ✓");
   return _client;
 }
+
+// ── Types ───────────────────────────────────────────────────
 
 export interface ProbateLead {
   id: number;
@@ -85,6 +97,8 @@ export interface DbDiagnostic {
   roleError: string | null;
 }
 
+// ── Diagnostic ──────────────────────────────────────────────
+
 export async function runDbDiagnostic(): Promise<DbDiagnostic> {
   const db = getSupabase();
   const url = RESOLVED_SUPABASE_URL;
@@ -106,7 +120,8 @@ export async function runDbDiagnostic(): Promise<DbDiagnostic> {
     roleError: null,
   };
 
-  console.log("[DiagDB] Querying: SELECT count(*) FROM public.probate_leads");
+  // 1. Raw count
+  console.log("[DiagDB] SELECT count(*) FROM public.probate_leads");
   const { count, error: countErr } = await db
     .from("probate_leads")
     .select("*", { count: "exact", head: true });
@@ -119,7 +134,8 @@ export async function runDbDiagnostic(): Promise<DbDiagnostic> {
     console.log(`[DiagDB] probate_leads row count: ${diag.rawCountResult}`);
   }
 
-  console.log("[DiagDB] Querying information_schema.tables WHERE schema=public");
+  // 2. Table list
+  console.log("[DiagDB] Querying information_schema.tables");
   const { data: tables, error: tableErr } = await db
     .from("information_schema.tables" as unknown as "probate_leads")
     .select("table_name")
@@ -133,19 +149,16 @@ export async function runDbDiagnostic(): Promise<DbDiagnostic> {
     diag.tableListResult = (tables ?? []).map(
       (t: Record<string, string>) => t["table_name"] ?? ""
     );
-    console.log(
-      "[DiagDB] Tables in public schema:",
-      diag.tableListResult.join(", ")
-    );
+    console.log("[DiagDB] Tables:", diag.tableListResult.join(", "));
     if (!diag.tableListResult.includes("probate_leads")) {
       console.error(
-        "[DiagDB] ⚠ probate_leads NOT in table list — " +
-          "check you are connected to the correct Supabase project!"
+        "[DiagDB] ⚠ probate_leads NOT in table list — wrong Supabase project!"
       );
     }
   }
 
-  console.log("[DiagDB] Fetching first 5 rows from probate_leads...");
+  // 3. Sample rows
+  console.log("[DiagDB] Fetching first 5 rows...");
   const { data: sample, error: sampleErr } = await db
     .from("probate_leads")
     .select("id,case_number,deceased_name,property_match_status")
@@ -154,21 +167,22 @@ export async function runDbDiagnostic(): Promise<DbDiagnostic> {
 
   if (sampleErr) {
     diag.sampleError = JSON.stringify(sampleErr);
-    console.error("[DiagDB] Sample fetch error:", diag.sampleError);
+    console.error("[DiagDB] Sample error:", diag.sampleError);
   } else {
     diag.sampleRows = (sample ?? []) as ProbateLead[];
-    console.log(`[DiagDB] Sample rows returned: ${diag.sampleRows.length}`);
+    console.log(`[DiagDB] Sample rows: ${diag.sampleRows.length}`);
     diag.sampleRows.forEach((r) =>
       console.log(
-        `[DiagDB]   id=${r.id} case=${r.case_number} deceased="${r.deceased_name}" status="${r.property_match_status}"`
+        `[DiagDB]   id=${r.id} case=${r.case_number} ` +
+          `deceased="${r.deceased_name}" status="${r.property_match_status}"`
       )
     );
   }
 
+  // 4. Current role
   const { data: roleData, error: roleErr } = await db.rpc("current_user");
   if (roleErr) {
     diag.roleError = JSON.stringify(roleErr);
-    console.log("[DiagDB] Role check not available:", diag.roleError);
   } else {
     diag.currentRole = String(roleData);
     console.log(`[DiagDB] Current DB role: ${diag.currentRole}`);
@@ -177,12 +191,12 @@ export async function runDbDiagnostic(): Promise<DbDiagnostic> {
   return diag;
 }
 
+// ── Fetch eligible leads ─────────────────────────────────────
+
 export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
   const db = getSupabase();
 
-  console.log(
-    "[DB] Fetching ALL rows from probate_leads (no server-side filter)..."
-  );
+  console.log("[DB] Fetching ALL rows from probate_leads (no server filter)...");
   console.log(`[DB] Using URL: ${RESOLVED_SUPABASE_URL}`);
 
   const { data, error, count } = await db
@@ -205,17 +219,15 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
 
   if (all.length === 0) {
     console.warn(
-      "[DB] ── Zero rows returned from probate_leads.\n" +
-        "[DB]    Possible causes:\n" +
-        "[DB]    1. Railway SUPABASE_URL points to a DIFFERENT project than Vercel\n" +
-        "[DB]    2. RLS is blocking reads (check Supabase → Auth → Policies)\n" +
-        "[DB]    3. Table is in a non-public schema\n" +
-        "[DB]    4. Ingestion has not been run yet\n" +
-        `[DB]    Active URL: ${RESOLVED_SUPABASE_URL}`
+      "[DB] ── Zero rows from probate_leads.\n" +
+        "[DB]    Most likely cause: Railway SUPABASE_URL is a different project.\n" +
+        "[DB]    Hit /debug-db to confirm. Active URL: " +
+        RESOLVED_SUPABASE_URL
     );
     return [];
   }
 
+  // Status breakdown
   const statusMap: Record<string, number> = {};
   for (const row of all) {
     const k =
@@ -224,11 +236,9 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
         : `"${row.property_match_status}"`;
     statusMap[k] = (statusMap[k] ?? 0) + 1;
   }
-  console.log(
-    "[DB] ── Status breakdown     :",
-    JSON.stringify(statusMap)
-  );
+  console.log("[DB] ── Status breakdown     :", JSON.stringify(statusMap));
 
+  // JS-side filtering (avoids PostgREST NULL exclusion bug)
   const withName = all.filter(
     (r) =>
       r.deceased_name !== null &&
@@ -236,9 +246,7 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
       r.deceased_name.trim().length > 0
   );
   console.log(`[DB] ── With deceased_name   : ${withName.length}`);
-  console.log(
-    `[DB] ── Without name (skip)  : ${all.length - withName.length}`
-  );
+  console.log(`[DB] ── Without name (skip)  : ${all.length - withName.length}`);
 
   const alreadyMatched = withName.filter(
     (r) => r.property_match_status === "matched"
@@ -257,13 +265,14 @@ export async function fetchEligibleLeads(): Promise<ProbateLead[]> {
           r.property_match_status === null
             ? "NULL"
             : `"${r.property_match_status}"`
-        } ` +
-        `deceased="${r.deceased_name}"`
+        } deceased="${r.deceased_name}"`
     )
   );
 
   return eligible;
 }
+
+// ── Update helpers ───────────────────────────────────────────
 
 export async function updateMatchedProperty(
   id: number,
